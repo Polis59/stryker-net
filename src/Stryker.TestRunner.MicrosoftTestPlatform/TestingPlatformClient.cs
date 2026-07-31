@@ -137,16 +137,19 @@ public sealed class TestingPlatformClient : ITestingPlatformClient
                 return discoveryListener;
             }, @checked);
 
-    public async Task<ResponseListener> RunTestsAsync(Guid requestId, Func<TestNodeUpdate[], Task> action, TestNode[]? testNodes = null)
+    public async Task<ResponseListener> RunTestsAsync(Guid requestId, Func<TestNodeUpdate[], Task> action, TestNode[]? testNodes = null, CancellationToken cancellationToken = default)
         => await CheckedInvokeAsync(async () =>
         {
-            using CancellationTokenSource cancellationTokenSource = new(TimeSpan.FromMinutes(3));
+            using CancellationTokenSource timeoutSource = new(TimeSpan.FromMinutes(3));
+            // The caller's token lets the runner cancel a run that has already produced a verdict
+            // (bail); StreamJsonRpc converts the cancellation into a notification the server honours.
+            using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(timeoutSource.Token, cancellationToken);
             var runListener = new TestNodeUpdatesResponseListener(requestId, action);
             _targetHandler.RegisterResponseListener(runListener);
             var requestNodes = testNodes
                 ?.Select(node => new RunRequestTestNode(node.Uid, node.DisplayName))
                 .ToArray();
-            await JsonRpcClient.InvokeWithParameterObjectAsync("testing/runTests", new RunTestsRequest(RunId: requestId, Tests: requestNodes), cancellationToken: cancellationTokenSource.Token);
+            await JsonRpcClient.InvokeWithParameterObjectAsync("testing/runTests", new RunTestsRequest(RunId: requestId, Tests: requestNodes), cancellationToken: linkedSource.Token);
             return runListener;
         });
 

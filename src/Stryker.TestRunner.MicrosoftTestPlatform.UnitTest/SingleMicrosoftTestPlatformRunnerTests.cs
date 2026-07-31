@@ -709,7 +709,7 @@ public class SingleMicrosoftTestPlatformRunnerTests
             => _discovered = discovered;
 
         internal override Task<(TestRunResult? Result, bool TimedOut, List<TestNode>? DiscoveredTests)> RunAssemblyTestsAsync(
-            string assembly, ITimeoutValueCalculator? timeoutCalc)
+            string assembly, ITimeoutValueCalculator? timeoutCalc, Func<TestNode, bool>? testUidFilter = null, Func<TestNodeUpdate, bool>? bailPredicate = null)
             => Task.FromResult<(TestRunResult?, bool, List<TestNode>?)>(
                 (new TestRunResult(false, "simulated test host crash"), false, _discovered));
     }
@@ -1320,7 +1320,7 @@ public class SingleMicrosoftTestPlatformRunnerTests
     }
 
     [TestMethod, Timeout(1000)]
-    public async Task TestMultipleMutantsAsync_SetsSessionTimedOut_WhenAssemblyTimesOut()
+    public async Task TestMultipleMutantsAsync_ClassifiesMutantAsTimedOut_WhenAssemblyTimesOut()
     {
         var assembly = "/fake/assembly.dll";
         var testNode = new TestNode("test-uid-1", "TestMethod1", "test", "discovered");
@@ -1341,7 +1341,16 @@ public class SingleMicrosoftTestPlatformRunnerTests
 
         var result = await runner.TestMultipleMutantsAsync(project.Object, timeoutCalc.Object, [mutant.Object], null);
 
-        result.SessionTimedOut.ShouldBeTrue();
+        // Each mutant runs in its own session and is classified by the runner directly; the merged
+        // result deliberately carries no session flags, or the executor would re-analyze the whole
+        // group against the union of per-mutant results.
+        mutant.Verify(x => x.AnalyzeTestRun(
+            It.IsAny<ITestIdentifiers>(),
+            It.IsAny<ITestIdentifiers>(),
+            It.IsAny<ITestIdentifiers>(),
+            true,
+            false), Times.Once);
+        result.SessionTimedOut.ShouldBeFalse();
     }
 
     [TestMethod, Timeout(1000)]
@@ -1445,7 +1454,7 @@ public class SingleMicrosoftTestPlatformRunnerTests
             : base(id, testsByAssembly, testDescriptions, testSet, discoveryLock, logger) { }
 
         internal override Task<(TestRunResult? Result, bool TimedOut, List<TestNode>? DiscoveredTests)> RunAssemblyTestsAsync(
-            string assembly, ITimeoutValueCalculator? timeoutCalc)
+            string assembly, ITimeoutValueCalculator? timeoutCalc, Func<TestNode, bool>? testUidFilter = null, Func<TestNodeUpdate, bool>? bailPredicate = null)
         {
             var discoveredTests = GetDiscoveredTests(assembly);
             var result = new TestRunResult(
@@ -1472,7 +1481,7 @@ public class SingleMicrosoftTestPlatformRunnerTests
             : base(id, testsByAssembly, testDescriptions, testSet, discoveryLock, logger) { }
 
         internal override Task<(TestRunResult? Result, bool TimedOut, List<TestNode>? DiscoveredTests)> RunAssemblyTestsAsync(
-            string assembly, ITimeoutValueCalculator? timeoutCalc)
+            string assembly, ITimeoutValueCalculator? timeoutCalc, Func<TestNode, bool>? testUidFilter = null, Func<TestNodeUpdate, bool>? bailPredicate = null)
         {
             var discoveredTests = GetDiscoveredTests(assembly);
             var result = new TestRunResult(
