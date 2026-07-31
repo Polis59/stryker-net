@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    xUnit test suite for the collectible-isolation MTP runner: runner lifecycle, run-request wire
+    encoding, and campaign diagnostics. Kept as xUnit (unlike the MSTest UnitTest project) because
+    the suite exercises xUnit-specific activation semantics.
+  -->
+  <PropertyGroup>
+    <AssemblyName>Stryker.TestRunner.MicrosoftTestPlatform.Tests</AssemblyName>
+    <RootNamespace>Stryker.TestRunner.MicrosoftTestPlatform.Tests</RootNamespace>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <NoWarn>$(NoWarn);MSB3277;CS8600;CS8602;CS8604;CS8618;CS8625;xUnit1031</NoWarn>
+    <RestorePackagesWithLockFile>false</RestorePackagesWithLockFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="Moq" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Stryker.TestRunner.MicrosoftTestPlatform\Stryker.TestRunner.MicrosoftTestPlatform.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+</Project>

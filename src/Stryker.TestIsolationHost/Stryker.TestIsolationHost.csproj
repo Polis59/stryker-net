@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Broker process that runs one mutant's assessing tests in a fresh collectible
+    AssemblyLoadContext per request. A mutation inside a static initializer only
+    takes effect while the type initializes, which happens once per load context;
+    collectible contexts give every such mutant cold-start semantics at a fraction
+    of a process spawn. The MTP runner starts this host once per test assembly and
+    talks to it over a named pipe; see CollectibleTestIsolationClient.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>Stryker.TestIsolationHost</AssemblyName>
+    <RootNamespace>Stryker.TestIsolationHost</RootNamespace>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <RestorePackagesWithLockFile>false</RestorePackagesWithLockFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3.runner.inproc.console" />
+  </ItemGroup>
+</Project>

@@ -137,19 +137,27 @@ public sealed class TestingPlatformClient : ITestingPlatformClient
                 return discoveryListener;
             }, @checked);
 
-    public async Task<ResponseListener> RunTestsAsync(Guid requestId, Func<TestNodeUpdate[], Task> action, TestNode[]? testNodes = null, CancellationToken cancellationToken = default)
+    public async Task<ResponseListener> RunTestsAsync(Guid requestId, Func<TestNodeUpdate[], Task> action, TestNode[]? testNodes = null, TimeSpan? runTimeout = null)
         => await CheckedInvokeAsync(async () =>
         {
-            using CancellationTokenSource timeoutSource = new(TimeSpan.FromMinutes(3));
-            // The caller's token lets the runner cancel a run that has already produced a verdict
-            // (bail); StreamJsonRpc converts the cancellation into a notification the server honours.
-            using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(timeoutSource.Token, cancellationToken);
+            // The RPC call returns when the run completes, so its cancellation window must cover
+            // the whole session budget: a serial map-activated batch can legitimately run longer
+            // than any fixed cap, and cancelling mid-run surfaces as an OperationCanceledException
+            // the caller cannot tell apart from a hung server. The session-level timeout in
+            // AssemblyTestServer stays the authoritative budget; this token only backstops a
+            // server that never answers at all.
+            var rpcWindow = TimeSpan.FromMinutes(3);
+            if (runTimeout is { } budget && budget + TimeSpan.FromSeconds(30) > rpcWindow)
+            {
+                rpcWindow = budget + TimeSpan.FromSeconds(30);
+            }
+            using CancellationTokenSource cancellationTokenSource = new(rpcWindow);
             var runListener = new TestNodeUpdatesResponseListener(requestId, action);
             _targetHandler.RegisterResponseListener(runListener);
             var requestNodes = testNodes
                 ?.Select(node => new RunRequestTestNode(node.Uid, node.DisplayName))
                 .ToArray();
-            await JsonRpcClient.InvokeWithParameterObjectAsync("testing/runTests", new RunTestsRequest(RunId: requestId, Tests: requestNodes), cancellationToken: linkedSource.Token);
+            await JsonRpcClient.InvokeWithParameterObjectAsync("testing/runTests", new RunTestsRequest(RunId: requestId, Tests: requestNodes), cancellationToken: cancellationTokenSource.Token);
             return runListener;
         });
 

@@ -142,8 +142,15 @@ public class ProjectMutator : IProjectMutator
         return (null, null);
     }
 
-    private static (string methodName, string? className, string? namespaceName) ParseMethodComponents(string sourceName)
+    private static (string methodName, string? className, string? namespaceName) ParseMethodComponents(string? sourceName)
     {
+        // A runner that cannot supply a source identity (neither a fully qualified name nor a
+        // display name) simply gets no test-to-source enrichment; it must not crash the run.
+        if (string.IsNullOrWhiteSpace(sourceName))
+        {
+            return (string.Empty, null, null);
+        }
+
         var nameWithoutParams = sourceName.Contains('(')
             ? sourceName[..sourceName.IndexOf('(')].Trim()
             : sourceName.Trim();

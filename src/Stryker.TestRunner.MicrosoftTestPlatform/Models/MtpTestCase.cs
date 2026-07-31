@@ -10,34 +10,21 @@ public sealed class MtpTestCase : ITestCase
     public MtpTestCase(TestNode testNode)
     {
         _testNode = testNode;
-        CodeFilePath = testNode.LocationFile ?? string.Empty;
-        // If the test framework doesn't provide location info, we will use LineNumberNotFound to indicate that the line number is unknown.
-        // ProjectMutator will try to find the test method by name in this case.
-        LineNumber = testNode.LocationLineStart ?? ITestCase.LineNumberNotFound;
-        FullyQualifiedName = BuildFullyQualifiedName(testNode);
     }
 
-    public string FullyQualifiedName { get; }
+    // xUnit's default display name is the fully qualified method name; MTP exposes no richer
+    // source identity, and consumers (e.g. test-to-source enrichment) dereference this.
+    public string FullyQualifiedName => _testNode.DisplayName;
     public Uri Uri => new("executor://MicrosoftTestPlatform");
     public int LineNumber { get; }
 
-    public string Source { get; init; } = string.Empty;
-    public string CodeFilePath { get; }
+    public string Source { get; }
+    public string CodeFilePath => string.Empty;
 
-    public string AssemblyPath { get; init; } = string.Empty;
+    public string AssemblyPath { get; init; }
 
     public Guid Guid { get; }
     public string Name => _testNode.DisplayName;
 
     public string Id => _testNode.Uid;
-
-    private static string BuildFullyQualifiedName(TestNode testNode)
-    {
-        if (testNode.LocationType is not null && testNode.LocationMethod is not null)
-        {
-            return $"{testNode.LocationType}.{testNode.LocationMethod}";
-        }
-
-        return testNode.Uid;
-    }
 }

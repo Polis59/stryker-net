@@ -42,4 +42,3 @@ public sealed class MtpTestDescription : IFrameworkTestDescription
 
     public void ClearInitialResult() => _initialResults.Clear();
 }
-

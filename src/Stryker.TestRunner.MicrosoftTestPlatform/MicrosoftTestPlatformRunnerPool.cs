@@ -19,7 +19,9 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
 {
     private readonly AutoResetEvent _runnerAvailableHandler = new(false);
     private readonly ConcurrentBag<SingleMicrosoftTestPlatformRunner> _availableRunners = new();
-    private static readonly List<SingleMicrosoftTestPlatformRunner> _allRunners = new();
+    // Instance-scoped: there is one pool per run, and a static list would leak disposed runners
+    // across pool instances (notably between unit tests, and across solution-project pools).
+    private readonly ConcurrentBag<SingleMicrosoftTestPlatformRunner> _allRunners = new();
     private bool _disposed;
     private readonly ILogger _logger;
     private readonly int _countOfRunners;
@@ -27,6 +29,10 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
     private readonly Dictionary<string, List<TestNode>> _testsByAssembly = new();
     private readonly Dictionary<string, MtpTestDescription> _testDescriptions = new();
     private readonly object _discoveryLock = new();
+    private readonly object _coverageCacheLock = new();
+    private readonly Dictionary<
+        CoverageConfidence,
+        IReadOnlyList<ICoverageRunResult>> _perTestCoverageCache = [];
     private readonly ISingleRunnerFactory _runnerFactory;
     private readonly IStrykerOptions _options;
 
@@ -39,6 +45,7 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
         _countOfRunners = Math.Max(1, options.Concurrency);
         _runnerFactory = runnerFactory ?? new DefaultRunnerFactory();
         _logger.LogWarning("The Microsoft Test Platform testrunner is currently in preview. Results should be verified since this feature is still being tested.");
+        MutationCampaignProgressReporter.RunnerPoolCreated(_countOfRunners);
 
         Initialize();
     }
@@ -92,18 +99,6 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
 
         var results = await RunThisAsync(runner => runner.InitialTestAsync(project)).ConfigureAwait(false);
 
-        // Bail must never trigger on a test that fails without any mutation, so every runner needs
-        // the initial run's failing tests. The EveryTest sentinel means the run itself broke; the
-        // campaign aborts on that, so there is nothing useful to record.
-        if (!results.FailingTests.IsEveryTest)
-        {
-            var initialFailing = results.FailingTests.GetIdentifiers().ToHashSet(StringComparer.Ordinal);
-            foreach (var runner in _allRunners)
-            {
-                runner.InitialRunFailingTests = initialFailing;
-            }
-        }
-
         // reset all test processes after the initial test run
         ResetTestProcesses();
 
@@ -112,142 +107,20 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
 
     public IEnumerable<ICoverageRunResult> CaptureCoverage(IProjectAndTests project)
     {
-        // Per-test coverage is what CoverageBasedTest ("perTest", the default) asks for: each
-        // mutant is then assessed only by the tests that actually cover it. The aggregate capture
-        // remains the fallback — it attributes every covered mutant to every test, which is safe
-        // but forces each mutation session to run the full suite.
         if (_options.OptimizationMode.HasFlag(OptimizationModes.CoverageBasedTest))
         {
-            try
-            {
-                return CaptureCoveragePerTest(project);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex,
-                    "Per-test coverage capture failed; falling back to aggregate coverage (every test is assumed to cover every mutant).");
-            }
+            var confidence = _options.OptimizationMode.HasFlag(OptimizationModes.CaptureCoveragePerTest)
+                ? CoverageConfidence.Exact
+                : CoverageConfidence.Normal;
+            return CaptureCoverageTestByTest(project, confidence);
         }
 
-        return CaptureAggregateCoverage(project);
+        return CaptureCoverageInOneGo(project);
     }
 
-    // Coverage is a property of the test suite, not of the source project under mutation, yet in
-    // solution mode every source project's mutation-test process asks for it. Cache the sweep per
-    // test-assembly set so the suite runs once instead of once per source project.
-    private readonly object _coverageCacheLock = new();
-    private (string Key, List<ICoverageRunResult> Results)? _perTestCoverageCache;
-
-    private IEnumerable<ICoverageRunResult> CaptureCoveragePerTest(IProjectAndTests project)
+    private IEnumerable<ICoverageRunResult> CaptureCoverageInOneGo(IProjectAndTests project)
     {
-        var cacheKey = string.Join(";", project.GetTestAssemblies().OrderBy(a => a, StringComparer.OrdinalIgnoreCase));
-        lock (_coverageCacheLock)
-        {
-            if (_perTestCoverageCache is { } cached && cached.Key == cacheKey)
-            {
-                _logger.LogInformation("Reusing per-test mutation coverage captured earlier for the same test assemblies");
-                return cached.Results;
-            }
-        }
-
-        var captured = CaptureCoveragePerTestUncached(project);
-        lock (_coverageCacheLock)
-        {
-            _perTestCoverageCache = (cacheKey, captured);
-        }
-
-        return captured;
-    }
-
-    private List<ICoverageRunResult> CaptureCoveragePerTestUncached(IProjectAndTests project)
-    {
-        _logger.LogInformation("Capturing per-test mutation coverage on persistent test hosts");
-
-        foreach (var runner in _allRunners)
-        {
-            runner.SetCoverageMode(true);
-        }
-
-        try
-        {
-            var results = new List<ICoverageRunResult>();
-
-            foreach (var assembly in project.GetTestAssemblies())
-            {
-                List<TestNode>? tests;
-                lock (_discoveryLock)
-                {
-                    _testsByAssembly.TryGetValue(assembly, out tests);
-                    tests = tests?.ToList();
-                }
-
-                if (tests is null || tests.Count == 0)
-                {
-                    continue;
-                }
-
-                // Partition the tests across the pool and let each slice hold one runner for its
-                // whole run: one blocking pool acquisition per runner, not one per test.
-                var slices = tests
-                    .Select((test, index) => (test, index))
-                    .GroupBy(pair => pair.index % _countOfRunners)
-                    .Select(group => group.Select(pair => pair.test).ToList())
-                    .ToList();
-
-                var sliceTasks = slices.Select(slice => RunThisAsync(async runner =>
-                {
-                    var sliceResults = new List<(string Uid, IReadOnlyList<int> Covered, IReadOnlyList<int> Statics)>(slice.Count);
-                    foreach (var test in slice)
-                    {
-                        var (covered, statics) = await runner.CaptureTestCoverageAsync(assembly, test).ConfigureAwait(false);
-                        sliceResults.Add((test.Uid, covered, statics));
-                    }
-
-                    return sliceResults;
-                })).ToArray();
-
-                foreach (var (uid, covered, statics) in Task.WhenAll(sliceTasks).GetAwaiter().GetResult().SelectMany(r => r))
-                {
-                    string testId;
-                    lock (_discoveryLock)
-                    {
-                        testId = _testDescriptions.TryGetValue(uid, out var description) ? description.Id : uid;
-                    }
-
-                    // Normal confidence is deliberate: the analyser then assesses static mutants
-                    // against every test (a warm host cannot observe which tests would rerun a
-                    // static initializer) while ordinary mutants get exactly their covering tests.
-                    results.Add(CoverageRunResult.Create(testId, CoverageConfidence.Normal, covered, statics, []));
-                }
-            }
-
-            var distinctCovered = results.SelectMany(r => r.MutationsCovered).Distinct().Count();
-            _logger.LogInformation("Per-test coverage capture complete: {TestCount} tests, {CoveredCount} distinct mutations covered",
-                results.Count, distinctCovered);
-
-            if (results.Count > 0 && distinctCovered == 0)
-            {
-                // Individual tests may legitimately cover nothing, but a whole suite covering no
-                // mutant at all means the flush protocol never worked; surface it so the caller
-                // falls back to aggregate coverage instead of classifying every mutant NoCoverage.
-                throw new InvalidOperationException(
-                    "Per-test coverage capture produced no coverage for any test; the coverage flush protocol is not functioning.");
-            }
-
-            return results;
-        }
-        finally
-        {
-            foreach (var runner in _allRunners)
-            {
-                runner.SetCoverageMode(false);
-            }
-        }
-    }
-
-    private IEnumerable<ICoverageRunResult> CaptureAggregateCoverage(IProjectAndTests project)
-    {
-        _logger.LogInformation("Starting coverage capture for MTP runner");
+        _logger.LogInformation("Starting aggregate coverage capture for MTP runner");
 
         // Enable coverage mode on all runners
         foreach (var runner in _allRunners)
@@ -257,7 +130,6 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
 
         try
         {
-            // Run all tests with coverage tracking enabled
             var testResult = RunThisAsync(runner => runner.InitialTestAsync(project)).GetAwaiter().GetResult();
 
             if (testResult.FailingTests.IsEveryTest)
@@ -265,10 +137,8 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
                 _logger.LogWarning("Coverage test run failed: {Message}", testResult.ResultMessage);
             }
 
-            // Reset test processes to trigger coverage file flush (process exit writes coverage)
             ResetTestProcesses();
 
-            // Aggregate coverage data from all runners
             var allCoveredMutants = new HashSet<int>();
             var allStaticMutants = new HashSet<int>();
 
@@ -285,12 +155,9 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
                 }
             }
 
-            _logger.LogInformation("Coverage capture complete: {CoveredCount} mutations covered, {StaticCount} static mutations",
+            _logger.LogInformation("Aggregate coverage capture complete: {CoveredCount} mutations covered, {StaticCount} static mutations",
                 allCoveredMutants.Count, allStaticMutants.Count);
 
-            // For cumulative coverage, we return a single coverage result that applies to all tests
-            // Each test is assumed to cover all the mutations that were covered during the full test run
-            // Static mutants are marked as such for proper handling during mutation testing
             return _testDescriptions.Values.Select(testDescription =>
                 CoverageRunResult.Create(
                     testDescription.Id,
@@ -301,12 +168,133 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
         }
         finally
         {
-            // Disable coverage mode on all runners for subsequent mutation testing
             foreach (var runner in _availableRunners)
             {
                 runner.SetCoverageMode(false);
             }
         }
+    }
+
+    private IEnumerable<ICoverageRunResult> CaptureCoverageTestByTest(
+        IProjectAndTests project, CoverageConfidence confidence)
+    {
+        lock (_coverageCacheLock)
+        {
+            if (_perTestCoverageCache.TryGetValue(confidence, out var cached))
+            {
+                MutationCampaignProgressReporter.CoverageSnapshotReused(cached.Count);
+                _logger.LogInformation(
+                    "Reusing {TestCount} exact per-test coverage mappings from the campaign snapshot",
+                    cached.Count);
+                return cached;
+            }
+        }
+
+        _logger.LogInformation("Starting exact per-test coverage capture for MTP runner");
+
+        foreach (var runner in _availableRunners)
+        {
+            runner.SetCoverageMode(true);
+        }
+
+        try
+        {
+            var allTests = new List<(string Assembly, TestNode Test)>();
+            foreach (var (assembly, tests) in _testsByAssembly)
+            {
+                foreach (var test in tests)
+                {
+                    if (_testDescriptions.ContainsKey(test.Uid))
+                    {
+                        allTests.Add((assembly, test));
+                    }
+                }
+            }
+
+            var coverageGroups = allTests
+                .GroupBy(test => (test.Assembly, Boundary: GetCoverageBoundary(test.Test)))
+                .Select(group => (
+                    group.Key.Assembly,
+                    group.Key.Boundary,
+                    Tests: (IReadOnlyList<TestNode>)group.Select(test => test.Test).ToList()))
+                .ToList();
+            MutationCampaignProgressReporter.CoverageCaptureStarted(
+                allTests.Count,
+                coverageGroups.Count);
+
+            _logger.LogInformation(
+                "Capturing per-test coverage for {TestCount} tests in {GroupCount} collectible class boundaries across {AssemblyCount} assemblies",
+                allTests.Count,
+                coverageGroups.Count,
+                _testsByAssembly.Count);
+
+            var results = new ConcurrentBag<ICoverageRunResult>();
+
+            Parallel.ForEach(coverageGroups,
+                new ParallelOptions { MaxDegreeOfParallelism = _countOfRunners },
+                coverageGroup =>
+                {
+                    var groupResults = RunThisAsync(async runner =>
+                        await runner.RunTestGroupForCoverageAsync(
+                            coverageGroup.Assembly,
+                            coverageGroup.Tests,
+                            confidence)
+                            .ConfigureAwait(false))
+                        .GetAwaiter().GetResult();
+
+                    foreach (var result in groupResults)
+                    {
+                        results.Add(result);
+                    }
+                });
+
+            var captured = results.ToList();
+            MutationCampaignProgressReporter.CoverageCaptureCompleted(
+                captured.Count,
+                coverageGroups.Count);
+            _logger.LogInformation(
+                "Per-test coverage capture complete: {TestCount} exact mappings captured from {GroupCount} collectible contexts",
+                captured.Count,
+                coverageGroups.Count);
+
+            // Stryker 4.16 injects every solution-project assembly before it
+            // sequentially asks this one runner pool to assign coverage for
+            // each project. The capture therefore contains the complete mutant
+            // universe; recomputing it per project repeats identical test work.
+            lock (_coverageCacheLock)
+            {
+                _perTestCoverageCache[confidence] = captured;
+            }
+
+            return captured;
+        }
+        finally
+        {
+            foreach (var runner in _availableRunners)
+            {
+                runner.SetCoverageMode(false);
+            }
+        }
+    }
+
+    internal static string GetCoverageBoundary(TestNode test)
+    {
+        var displayName = test.DisplayName;
+        var argumentsStart = displayName.IndexOf('(');
+        var methodEnd = argumentsStart >= 0 ? argumentsStart : displayName.Length;
+        if (methodEnd == 0)
+        {
+            return test.Uid;
+        }
+
+        var classSeparator = displayName.LastIndexOf('.', methodEnd - 1);
+
+        // Standard xUnit display names are namespace-qualified class and method
+        // names. A custom display name has no reliable class boundary, so it
+        // remains a singleton rather than being grouped unsafely.
+        return classSeparator > 0
+            ? displayName[..classSeparator]
+            : test.Uid;
     }
 
     public async Task<ITestRunResult> TestMultipleMutantsAsync(
@@ -379,4 +367,3 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
         _runnerAvailableHandler.Dispose();
     }
 }
-
