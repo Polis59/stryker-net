@@ -358,7 +358,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
 
             if (!timedOut && await RequestCoverageFlushAsync(assembly, TimeSpan.FromSeconds(15)).ConfigureAwait(false))
             {
-                return ReadCoverageDataForAssembly(assembly);
+                return await ReadCoverageDataForAssemblyAsync(assembly).ConfigureAwait(false);
             }
 
             _logger.LogDebug(
@@ -407,7 +407,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     /// which unions all assemblies for the aggregate exit-time flush, per-test capture reads each
     /// assembly's file right after its flush is acknowledged.
     /// </summary>
-    internal (IReadOnlyList<int> CoveredMutants, IReadOnlyList<int> StaticMutants) ReadCoverageDataForAssembly(string assembly)
+    internal async Task<(IReadOnlyList<int> CoveredMutants, IReadOnlyList<int> StaticMutants)> ReadCoverageDataForAssemblyAsync(string assembly)
     {
         var coverageFilePath = GetCoverageFilePath(assembly);
         if (!File.Exists(coverageFilePath))
@@ -415,23 +415,37 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             return (Array.Empty<int>(), Array.Empty<int>());
         }
 
-        try
+        // The flush handshake guarantees the host closed the file before acknowledging, but other
+        // readers (most commonly on-close antivirus scans) can still hold it briefly, and losing a
+        // read silently drops one test's coverage — mutants covered only by that test would be
+        // misreported as NoCoverage. Retry sharing violations before giving up.
+        const int maxReadAttempts = 5;
+        for (var attempt = 1; ; attempt++)
         {
-            var content = File.ReadAllText(coverageFilePath).Trim();
-            if (string.IsNullOrEmpty(content))
+            try
             {
+                var content = File.ReadAllText(coverageFilePath).Trim();
+                if (string.IsNullOrEmpty(content))
+                {
+                    return (Array.Empty<int>(), Array.Empty<int>());
+                }
+
+                var parts = content.Split(';');
+                return (
+                    ParseMutantIds(parts.Length > 0 ? parts[0] : string.Empty),
+                    ParseMutantIds(parts.Length > 1 ? parts[1] : string.Empty));
+            }
+            catch (IOException ex) when (attempt < maxReadAttempts)
+            {
+                _logger.LogDebug(ex, "{RunnerId}: Coverage file at {Path} is transiently locked (attempt {Attempt}/{MaxAttempts}); retrying",
+                    RunnerId, coverageFilePath, attempt, maxReadAttempts);
+                await Task.Delay(20 * attempt).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "{RunnerId}: Failed to read coverage file at {Path}", RunnerId, coverageFilePath);
                 return (Array.Empty<int>(), Array.Empty<int>());
             }
-
-            var parts = content.Split(';');
-            return (
-                ParseMutantIds(parts.Length > 0 ? parts[0] : string.Empty),
-                ParseMutantIds(parts.Length > 1 ? parts[1] : string.Empty));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "{RunnerId}: Failed to read coverage file at {Path}", RunnerId, coverageFilePath);
-            return (Array.Empty<int>(), Array.Empty<int>());
         }
     }
 
