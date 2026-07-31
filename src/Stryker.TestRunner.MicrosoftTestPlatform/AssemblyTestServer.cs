@@ -152,6 +152,8 @@ internal sealed class AssemblyTestServer : IDisposable
         // the cancellation, the RPC call simply completes normally and nothing is lost but time.
         using var bailSource = new CancellationTokenSource();
         var bailed = false;
+        var stalled = false;
+        var lastUpdateTicks = Environment.TickCount64;
 
         Func<TestNodeUpdate[], Task> onUpdate = updates =>
         {
@@ -159,6 +161,8 @@ internal sealed class AssemblyTestServer : IDisposable
             {
                 firstUpdateMs = stageStopwatch.ElapsedMilliseconds;
             }
+
+            Volatile.Write(ref lastUpdateTicks, Environment.TickCount64);
 
             foreach (var update in updates)
             {
@@ -177,6 +181,39 @@ internal sealed class AssemblyTestServer : IDisposable
 
         if (timeout.HasValue)
         {
+            // Stall detection: a healthy mutant session streams results continuously (first
+            // update within a second, then a steady flow), while a hanging mutant goes silent.
+            // Cancelling on silence converts a hang's cost from the whole session budget to
+            // roughly the stall window, with the same honest Timeout verdict. The window is
+            // wider before the first update to leave room for a cold host's session build.
+            using var stallMonitorSource = new CancellationTokenSource();
+            _ = Task.Run(async () =>
+            {
+                while (!stallMonitorSource.Token.IsCancellationRequested)
+                {
+                    try
+                    {
+                        await Task.Delay(1000, stallMonitorSource.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
+
+                    var silenceMs = Environment.TickCount64 - Volatile.Read(ref lastUpdateTicks);
+                    var limitMs = Interlocked.Read(ref firstUpdateMs) < 0 ? 30_000 : 10_000;
+                    if (silenceMs > limitMs)
+                    {
+                        stalled = true;
+                        _logger.LogDebug(
+                            "{RunnerId}: Test run stalled ({SilenceMs} ms without an update) for {Assembly}; cancelling",
+                            _runnerId, silenceMs, _assembly);
+                        bailSource.Cancel();
+                        return;
+                    }
+                }
+            });
+
             ResponseListener executeTestsResponse;
             try
             {
@@ -192,6 +229,11 @@ internal sealed class AssemblyTestServer : IDisposable
             catch (OperationCanceledException) when (bailed)
             {
                 return (testResults.ToList(), false);
+            }
+            catch (OperationCanceledException ex) when (stalled)
+            {
+                _logger.LogDebug(ex, "{RunnerId}: Test run cancelled after stalling for {Assembly}", _runnerId, _assembly);
+                return (testResults.ToList(), true);
             }
             catch (OperationCanceledException ex)
             {
@@ -209,9 +251,23 @@ internal sealed class AssemblyTestServer : IDisposable
                 return (testResults.ToList(), false);
             }
 
+            if (stalled)
+            {
+                return (testResults.ToList(), true);
+            }
+
             ThrowIfHostCrashed(completionTask);
 
-            var completed = await completionTask.ConfigureAwait(false);
+            bool completed;
+            try
+            {
+                completed = await completionTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (stalled)
+            {
+                return (testResults.ToList(), true);
+            }
+
             _logger.LogInformation("{RunnerId}: RUNSTAGE firstUpdateMs={FirstUpdate} totalMs={Total} results={Results}",
                 _runnerId, firstUpdateMs, stageStopwatch.ElapsedMilliseconds, testResults.Count);
             return (testResults.ToList(), !completed);

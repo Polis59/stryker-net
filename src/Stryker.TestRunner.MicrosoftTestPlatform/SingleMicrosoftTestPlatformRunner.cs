@@ -1253,7 +1253,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         }
     }
 
-    internal TimeSpan? CalculateAssemblyTimeout(List<TestNode> discoveredTests, ITimeoutValueCalculator timeoutCalc, string assembly, bool serialActivation = false)
+    internal TimeSpan? CalculateAssemblyTimeout(List<TestNode> discoveredTests, ITimeoutValueCalculator timeoutCalc, string assembly, bool serialActivation = false, bool parallelMutantSession = false)
     {
         var estimatedTimeMs = (int)discoveredTests
             .Where(t => _testDescriptions.TryGetValue(t.Uid, out _))
@@ -1275,10 +1275,30 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         // budget stamps slow-but-passing batches as Timeout in bulk — verdicts that hide real
         // survivors. The floor sizes the budget to serial reality so a Timeout verdict means the
         // mutant genuinely hangs or drags, not that the batch outran an estimate.
+        // A whole-session single-mutant run keeps the host's parallel execution: every
+        // measured healthy session finishes in under four seconds regardless of set size
+        // (even the full 1,730-test suite), so its floor carries 5-10x headroom while a
+        // hanging mutant stops burning a serial-sized budget. The verdict is unchanged
+        // either way - only the price of reaching Timeout drops.
+        // The serial floor assumes the batch planner's union cap: a healthy serial map
+        // session at the cap finishes in about three seconds, so 100 ms per test still
+        // carries an order of magnitude of headroom. A mutant that slows its tests past
+        // that has earned its Timeout; pricing the budget for it would let one slow
+        // mutant drag a multi-mutant session for minutes.
         var floorMs = serialActivation
-            ? 30_000 + (500 * discoveredTests.Count)
-            : 15_000 + (100 * discoveredTests.Count);
-        if (timeoutMs < floorMs)
+            ? 10_000 + (100 * discoveredTests.Count)
+            : parallelMutantSession
+                ? 15_000 + (10 * discoveredTests.Count)
+                : 15_000 + (100 * discoveredTests.Count);
+        if (parallelMutantSession || serialActivation)
+        {
+            // The calculator's estimate sums smeared initial-run timings, which overshoots
+            // both session shapes by an order of magnitude and silently exceeds the floor
+            // for large sets. The floors above already carry 5-10x headroom over any
+            // measured healthy session, so they serve as the exact budget, not a minimum.
+            timeoutMs = floorMs;
+        }
+        else if (timeoutMs < floorMs)
         {
             timeoutMs = floorMs;
         }
@@ -1486,7 +1506,8 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                             timeoutCalc,
                             testUidFilter,
                             serialActivation: mutants is not null && !inactiveMap,
-                            bailPredicate: bailPredicate).ConfigureAwait(false);
+                            bailPredicate: bailPredicate,
+                            parallelMutantSession: mutants is not null && inactiveMap).ConfigureAwait(false);
 
                 if (discoveredTests is not null)
                 {
@@ -1661,6 +1682,21 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                         _testDescriptions.TryGetValue(test.Uid, out var description)
                             ? description.InitialRunTime.TotalMilliseconds
                             : 0)));
+        // The calculator's estimate sums initial timings smeared over the whole suite,
+        // which overshoots a collectible context severely for the broad sets static
+        // mutants carry. A healthy context executes its exact class-bounded set serially
+        // in-process in a few seconds, so this cap still carries several-fold headroom
+        // while a hanging static mutant stops burning a minute per verdict. The verdict
+        // an over-budget context receives - Timeout - is unchanged by the cap.
+        if (timeout.HasValue)
+        {
+            var capMs = 10_000 + (100 * testsToRun.Count);
+            if (timeout.Value.TotalMilliseconds > capMs)
+            {
+                timeout = TimeSpan.FromMilliseconds(capMs);
+            }
+        }
+
         var execution = await GetOrCreateIsolationClient(assembly)
             .ExecuteAsync(
                 testsToRun.Select(test => test.Uid).ToList(),
@@ -1742,7 +1778,8 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         ITimeoutValueCalculator? timeoutCalc,
         Func<TestNode, bool>? testUidFilter = null,
         bool serialActivation = false,
-        Func<TestNodeUpdate, bool>? bailPredicate = null)
+        Func<TestNodeUpdate, bool>? bailPredicate = null,
+        bool parallelMutantSession = false)
     {
         if (!File.Exists(assembly))
         {
@@ -1758,7 +1795,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             var testsToRun = testUidFilter is null
                 ? discoveredTests
                 : discoveredTests.Where(testUidFilter).ToList();
-            timeout = CalculateAssemblyTimeout(testsToRun, timeoutCalc, assembly, serialActivation);
+            timeout = CalculateAssemblyTimeout(testsToRun, timeoutCalc, assembly, serialActivation, parallelMutantSession);
         }
 
         var (testResults, timedOut) = await RunAssemblyTestsInternalAsync(assembly, testUidFilter, timeout, bailPredicate).ConfigureAwait(false);

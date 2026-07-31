@@ -17,7 +17,10 @@ namespace Stryker.TestRunner.MicrosoftTestPlatform;
 /// </summary>
 public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
 {
-    private readonly AutoResetEvent _runnerAvailableHandler = new(false);
+    // Counts available runners so checkout can await without a polling interval. The
+    // semaphore is released once per runner during initialization and once per return;
+    // a released count therefore always matches a runner sitting in _availableRunners.
+    private readonly SemaphoreSlim _runnerAvailable = new(0);
     private readonly ConcurrentBag<SingleMicrosoftTestPlatformRunner> _availableRunners = new();
     // Instance-scoped: there is one pool per run, and a static list would leak disposed runners
     // across pool instances (notably between unit tests, and across solution-project pools).
@@ -73,7 +76,7 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
                 _options);
             _availableRunners.Add(runner);
             _allRunners.Add(runner);
-            _runnerAvailableHandler.Set();
+            _runnerAvailable.Release();
         });
     }
 
@@ -314,30 +317,19 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
 
     private async Task<T> RunThisAsync<T>(Func<SingleMicrosoftTestPlatformRunner, Task<T>> task)
     {
-        SingleMicrosoftTestPlatformRunner? runner;
-
-        // Try to get a runner with a timeout to prevent indefinite blocking
-        var attempts = 0;
-        const int maxWaitTimeSeconds = 300; // 5 minutes max wait
-        const int waitIntervalMs = 1000; // Check every second
-        var maxAttempts = maxWaitTimeSeconds * 1000 / waitIntervalMs;
-
-        while (!_availableRunners.TryTake(out runner))
+        // The semaphore's count mirrors _availableRunners, so a successful wait
+        // guarantees the bag holds a runner. Awaiting (instead of the previous
+        // one-second AutoResetEvent poll, which also blocked a thread-pool thread)
+        // hands a returned runner to the next waiter immediately.
+        if (!await _runnerAvailable.WaitAsync(TimeSpan.FromMinutes(5)).ConfigureAwait(false))
         {
-            if (!_runnerAvailableHandler.WaitOne(waitIntervalMs))
-            {
-                attempts++;
-                if (attempts >= maxAttempts)
-                {
-                    throw new TimeoutException($"Timed out waiting for an available test runner after {maxWaitTimeSeconds} seconds. Available runners: {_availableRunners.Count}, Total runners: {_countOfRunners}");
-                }
+            throw new TimeoutException($"Timed out waiting for an available test runner after 300 seconds. Available runners: {_availableRunners.Count}, Total runners: {_countOfRunners}");
+        }
 
-                if (attempts % 30 == 0) // Log every 30 seconds
-                {
-                    _logger.LogWarning("Waiting for available test runner... ({Attempts}s elapsed, {Available}/{Total} runners available)",
-                        attempts, _availableRunners.Count, _countOfRunners);
-                }
-            }
+        if (!_availableRunners.TryTake(out var runner))
+        {
+            _runnerAvailable.Release();
+            throw new InvalidOperationException("The runner pool signalled availability but held no runner.");
         }
 
         try
@@ -347,7 +339,7 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
         finally
         {
             _availableRunners.Add(runner);
-            _runnerAvailableHandler.Set();
+            _runnerAvailable.Release();
         }
     }
 
@@ -364,6 +356,6 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
         {
             runner.Dispose();
         }
-        _runnerAvailableHandler.Dispose();
+        _runnerAvailable.Dispose();
     }
 }
