@@ -25,6 +25,10 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
 {
     private const string InactiveMutantMapHeader = "threadway-stryker-map-v1\toff";
     private const string ActiveMutantMapHeaderPrefix = "threadway-stryker-map-v1\tactive\t";
+    // Parallel multiplexed sessions: the xUnit hook binds each test's assigned mutant to the
+    // test's own execution context instead of serializing execution around a shared control
+    // value, so the host keeps its normal parallelism for multi-mutant requests.
+    private const string ActiveParallelMutantMapHeaderPrefix = "threadway-stryker-map-v1\tactive-parallel\t";
 
     private readonly int _id;
     private readonly Dictionary<string, List<TestNode>> _testsByAssembly;
@@ -40,6 +44,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     private readonly string _coverageMapFilePath;
     private readonly IStrykerOptions? _options;
     private string? _expectedMutantMapAcknowledgement;
+    private bool _mutantMapParallelActivation;
 
     private readonly Dictionary<string, AssemblyTestServer> _assemblyServers = new();
     private readonly Dictionary<string, CollectibleTestIsolationClient> _isolationClients = new();
@@ -282,11 +287,11 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         {
             // A single-mutant session needs no per-test switching: the mutant stays active
             // through the control file for the whole request, the activation map stays
-            // inactive, and the warm host keeps xUnit's normal parallelism. The per-test
-            // map exists to multiplex disjoint mutants through one request; paying its
-            // serialization tax on a session that assesses exactly one mutant turns the
-            // largest sessions (an every-test mutant requests the entire suite) from a
-            // parallel suite run into a serial one.
+            // inactive, and the warm host keeps xUnit's normal parallelism. A multi-mutant
+            // session multiplexes its disjoint mutants through the parallel activation map:
+            // the xUnit hook binds each test's assigned mutant to the test's own execution
+            // context, so the host keeps its parallelism there too instead of serializing
+            // around a single shared control value.
             result = await RunAllTestsAsync(
                 assemblies,
                 mutantId,
@@ -294,7 +299,8 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 update,
                 timeoutCalc,
                 testUidFilter,
-                wholeSessionActivation: mutants.Count == 1).ConfigureAwait(false);
+                wholeSessionActivation: mutants.Count == 1,
+                parallelMultiplexed: mutants.Count > 1).ConfigureAwait(false);
             return result;
         }
         finally
@@ -556,8 +562,9 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         IReadOnlyList<string> testUids) =>
         GetOrCreateIsolationClient(assembly).ExecuteAsync(testUids, timeout: null);
 
-    private Dictionary<string, int>? WriteMutantMap(IReadOnlyList<IMutant>? mutants)
+    private Dictionary<string, int>? WriteMutantMap(IReadOnlyList<IMutant>? mutants, bool parallelActivation = false)
     {
+        _mutantMapParallelActivation = parallelActivation;
         DeleteIfExists(_mutantMapAcknowledgementFilePath);
         DeleteIfExists(_mutantMapErrorFilePath);
         _expectedMutantMapAcknowledgement = null;
@@ -678,7 +685,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         var acknowledgement = Guid.NewGuid().ToString("N");
         var lines = new List<string>(assignments.Count + 1)
         {
-            ActiveMutantMapHeaderPrefix + acknowledgement,
+            (_mutantMapParallelActivation ? ActiveParallelMutantMapHeaderPrefix : ActiveMutantMapHeaderPrefix) + acknowledgement,
         };
         lines.AddRange(
             assignments
@@ -1288,7 +1295,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         var floorMs = serialActivation
             ? 10_000 + (100 * discoveredTests.Count)
             : parallelMutantSession
-                ? 15_000 + (10 * discoveredTests.Count)
+                ? 8_000 + (10 * discoveredTests.Count)
                 : 15_000 + (100 * discoveredTests.Count);
         if (parallelMutantSession || serialActivation)
         {
@@ -1432,6 +1439,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         Func<TestNode, bool>? testUidFilter = null,
         bool useCollectibleIsolation = false,
         bool wholeSessionActivation = false,
+        bool parallelMultiplexed = false,
         Func<TestNodeUpdate, bool>? bailPredicate = null)
     {
         try
@@ -1448,7 +1456,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             // explicitly: with the mutant active for the whole request no per-test
             // switching is needed and the warm host keeps xUnit's normal parallelism.
             var inactiveMap = useCollectibleIsolation || wholeSessionActivation;
-            var mapAssignments = WriteMutantMap(inactiveMap ? null : mutants);
+            var mapAssignments = WriteMutantMap(inactiveMap ? null : mutants, parallelActivation: parallelMultiplexed);
             WriteMutantIdToFile(mutantId);
 
             // Bail with stock's exact semantics: cancel the run request the moment every mutant
@@ -1505,9 +1513,9 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                             assembly,
                             timeoutCalc,
                             testUidFilter,
-                            serialActivation: mutants is not null && !inactiveMap,
+                            serialActivation: mutants is not null && !inactiveMap && !parallelMultiplexed,
                             bailPredicate: bailPredicate,
-                            parallelMutantSession: mutants is not null && inactiveMap).ConfigureAwait(false);
+                            parallelMutantSession: mutants is not null && (inactiveMap || parallelMultiplexed)).ConfigureAwait(false);
 
                 if (discoveredTests is not null)
                 {

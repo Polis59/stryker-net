@@ -62,6 +62,15 @@ namespace Stryker
         public static int ActiveMutant = -2;
         public const int ActiveMutantNotInitValue = -2;
 
+        // Ambient per-test activation for parallel multiplexed sessions. The test framework
+        // hook sets the value on the test's own execution context (via reflection, on every
+        // injected copy), so it flows through the test's entire async call tree while other
+        // tests running concurrently carry their own values. Stored as id + 1 so the
+        // AsyncLocal default (0) means "unset"; unset falls back to the control-file value,
+        // which the runner holds at -1 (inactive) during a parallel session. Null until a
+        // parallel session enables it, so serial and whole-session paths pay one null check.
+        private static System.Threading.AsyncLocal<int> _ambientMutant;
+
         static MutantControl()
         {
             // Check for MTP file-based coverage mode at class initialization
@@ -288,6 +297,43 @@ namespace Stryker
             }
         }
 
+        /// <summary>
+        /// Enables ambient (execution-context-local) activation for a parallel multiplexed
+        /// session. Called by the test framework hook via reflection before the first test of
+        /// such a session. Once enabled it stays enabled for the process lifetime: the field
+        /// is only consulted, never torn down, so concurrent tests never observe a mid-run
+        /// disable.
+        /// </summary>
+        public static void EnableAmbientActivation()
+        {
+            if (_ambientMutant == null)
+            {
+                _ambientMutant = new System.Threading.AsyncLocal<int>();
+            }
+        }
+
+        /// <summary>
+        /// Binds the given mutant to the current execution context. The test framework hook
+        /// calls this on the test's own context immediately before the test body runs, so the
+        /// binding flows through the test's async call tree and nowhere else.
+        /// </summary>
+        public static void SetAmbientMutant(int mutantId)
+        {
+            EnableAmbientActivation();
+            _ambientMutant.Value = mutantId + 1;
+        }
+
+        /// <summary>
+        /// Clears the current execution context's mutant binding after a test finishes.
+        /// </summary>
+        public static void ClearAmbientMutant()
+        {
+            if (_ambientMutant != null)
+            {
+                _ambientMutant.Value = 0;
+            }
+        }
+
         public static void SetActiveMutantViaEnvironmentVariable(int mutantId)
         {
             // Ensure we never assign null to a non-nullable string
@@ -483,6 +529,19 @@ namespace Stryker
             {
                 RegisterCoverage(id);
                 return false;
+            }
+
+            // Ambient activation takes precedence when a parallel multiplexed session bound a
+            // mutant to this execution context. An unset value (0) falls through to the file
+            // path: work on threads that predate the test carries no binding and must see the
+            // session's file value (-1, inactive) rather than another test's mutant.
+            if (_ambientMutant != null)
+            {
+                int ambient = _ambientMutant.Value;
+                if (ambient != 0)
+                {
+                    return id == ambient - 1;
+                }
             }
 
             // Check for file-based mutant control (used by MTP runner for process reuse).
