@@ -221,8 +221,18 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
                 }
             }
 
+            var distinctCovered = results.SelectMany(r => r.MutationsCovered).Distinct().Count();
             _logger.LogInformation("Per-test coverage capture complete: {TestCount} tests, {CoveredCount} distinct mutations covered",
-                results.Count, results.SelectMany(r => r.MutationsCovered).Distinct().Count());
+                results.Count, distinctCovered);
+
+            if (results.Count > 0 && distinctCovered == 0)
+            {
+                // Individual tests may legitimately cover nothing, but a whole suite covering no
+                // mutant at all means the flush protocol never worked; surface it so the caller
+                // falls back to aggregate coverage instead of classifying every mutant NoCoverage.
+                throw new InvalidOperationException(
+                    "Per-test coverage capture produced no coverage for any test; the coverage flush protocol is not functioning.");
+            }
 
             return results;
         }

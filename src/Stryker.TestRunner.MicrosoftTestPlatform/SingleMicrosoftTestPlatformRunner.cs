@@ -111,7 +111,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         // The active mutant is a process-global switch, so a group of mutants cannot run in one
         // session: activating none (the previous behaviour) runs the whole group against unmutated
         // code and fabricates the verdicts. Instead each mutant runs sequentially in its own
-        // session on the warm hosts, restricted to its own assessing tests.
+        // session, restricted to its own assessing tests.
         _logger.LogDebug("{RunnerId}: Testing mutant(s) [{Mutants}] sequentially",
             RunnerId, string.Join(",", mutants.Select(m => m.Id)));
 
@@ -135,12 +135,14 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 testUidFilter = t => uids.Contains(t.Uid);
             }
 
+            var ranOnFreshHost = false;
             if (mutant.IsStaticValue || mutant.MustBeTestedInIsolation)
             {
                 // A static initializer only executes on first type load, so the mutation must be
                 // active before a fresh host starts; a warm host would never run it mutated.
                 await ResetServerAsync().ConfigureAwait(false);
                 _hostRanStaticMutant = true;
+                ranOnFreshHost = true;
             }
             else if (_hostRanStaticMutant)
             {
@@ -148,9 +150,30 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 // the warm host, so it would leak into this mutant's verdict.
                 await ResetServerAsync().ConfigureAwait(false);
                 _hostRanStaticMutant = false;
+                ranOnFreshHost = true;
             }
 
-            var result = await RunAllTestsAsync(assemblies, mutant.Id, new[] { mutant }, update, timeoutCalc, testUidFilter).ConfigureAwait(false);
+            // First pass runs on whatever host is available — usually warm, which is fast. The
+            // handler is deliberately not invoked yet: a Survived verdict from a warm host is not
+            // trustworthy, because earlier tests' fixtures and product caches persist there and
+            // mutated code paths feeding those caches never re-execute.
+            var result = await RunAllTestsAsync(assemblies, mutant.Id, new[] { mutant }, update: null, timeoutCalc, testUidFilter).ConfigureAwait(false);
+
+            if (!ranOnFreshHost
+                && !result.SessionTimedOut
+                && !result.SessionHadRuntimeIssue
+                && !KillsMutant(result))
+            {
+                // Looks survived, but only a fresh host proves it: there the caches are cold, so
+                // every assessing test re-executes the mutated paths. A genuine survivor pays one
+                // extra session; a cache-hidden kill is recovered here.
+                _logger.LogDebug("{RunnerId}: Mutant {MutantId} survived on a warm host; confirming on a fresh one",
+                    RunnerId, mutant.Id);
+                await ResetServerAsync().ConfigureAwait(false);
+                result = await RunAllTestsAsync(assemblies, mutant.Id, new[] { mutant }, update: null, timeoutCalc, testUidFilter).ConfigureAwait(false);
+            }
+
+            update?.Invoke(new[] { mutant }, result.FailingTests, result.ExecutedTests, result.TimedOutTests);
 
             if (update is null || result.SessionTimedOut || result.SessionHadRuntimeIssue)
             {
@@ -174,6 +197,23 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         }
 
         return merged.Build(testDescriptionValues);
+    }
+
+    /// <summary>
+    /// True when the session result detects the mutant: some test failed that was not already
+    /// failing in the initial (unmutated) run, or some test timed out. Only a non-detection needs
+    /// the fresh-host confirmation pass.
+    /// </summary>
+    private bool KillsMutant(ITestRunResult result)
+    {
+        if (result.FailingTests.IsEveryTest)
+        {
+            return true;
+        }
+
+        var initialFailing = InitialRunFailingTests;
+        return result.FailingTests.GetIdentifiers().Any(id => !initialFailing.Contains(id))
+            || result.TimedOutTests.GetIdentifiers().Any();
     }
 
     /// <summary>
@@ -335,40 +375,44 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     }
 
     /// <summary>
-    /// Runs a single test on the warm host with coverage capture enabled and returns the mutants
-    /// it covered, using the control-file flush protocol to make the host write out per-test
-    /// coverage without restarting between tests. Retries once on a fresh host (re-running the
-    /// test, since a fresh host has no accumulated coverage) when the host fails to acknowledge
-    /// the flush; throws when the protocol cannot be established at all, so the pool can fall back
-    /// to aggregate coverage instead of silently reporting mutants as uncovered.
+    /// Runs a single test on a fresh test host with coverage capture enabled and returns the
+    /// mutants it covered. The host is fresh — never reused from a previous test — because a warm
+    /// host has executed earlier tests whose fixtures and product caches persist: mutated code
+    /// paths feeding those caches never re-execute, so a warm capture silently attributes their
+    /// mutants to whichever test happened to run first. The control-file flush protocol makes the
+    /// running host write out its coverage without waiting for a process exit. A flush that is
+    /// never acknowledged is reported as empty coverage: a test that touches no mutated assembly
+    /// never loads the watcher, and for it empty is the correct answer. The pool guards against
+    /// the pathological case of every test reporting empty.
     /// </summary>
     internal async Task<(IReadOnlyList<int> CoveredMutants, IReadOnlyList<int> StaticMutants)> CaptureTestCoverageAsync(
         string assembly,
         TestNode test)
     {
-        const int maxAttempts = 2;
+        // Fresh host per test: discard whatever host the previous capture left behind.
+        await DiscardServerAsync(assembly).ConfigureAwait(false);
+        await GetOrCreateServerAsync(assembly).ConfigureAwait(false);
 
-        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        var (_, timedOut) = await RunAssemblyTestsInternalAsync(
+            assembly,
+            t => string.Equals(t.Uid, test.Uid, StringComparison.Ordinal)).ConfigureAwait(false);
+
+        if (timedOut)
         {
-            await GetOrCreateServerAsync(assembly).ConfigureAwait(false);
-
-            var (_, timedOut) = await RunAssemblyTestsInternalAsync(
-                assembly,
-                t => string.Equals(t.Uid, test.Uid, StringComparison.Ordinal)).ConfigureAwait(false);
-
-            if (!timedOut && await RequestCoverageFlushAsync(assembly, TimeSpan.FromSeconds(15)).ConfigureAwait(false))
-            {
-                return await ReadCoverageDataForAssemblyAsync(assembly).ConfigureAwait(false);
-            }
-
-            _logger.LogDebug(
-                "{RunnerId}: Test host for {Assembly} did not acknowledge the coverage flush for test {Test} (attempt {Attempt}/{MaxAttempts}); restarting it",
-                RunnerId, Path.GetFileName(assembly), test.Uid, attempt, maxAttempts);
-            await DiscardServerAsync(assembly).ConfigureAwait(false);
+            _logger.LogDebug("{RunnerId}: Coverage run for test {Test} timed out; reporting no coverage for it",
+                RunnerId, test.Uid);
+            return (Array.Empty<int>(), Array.Empty<int>());
         }
 
-        throw new InvalidOperationException(
-            $"The test host for {assembly} did not acknowledge the per-test coverage flush; per-test coverage capture is unavailable.");
+        if (await RequestCoverageFlushAsync(assembly, TimeSpan.FromSeconds(20)).ConfigureAwait(false))
+        {
+            return await ReadCoverageDataForAssemblyAsync(assembly).ConfigureAwait(false);
+        }
+
+        _logger.LogDebug(
+            "{RunnerId}: Test host for {Assembly} did not acknowledge the coverage flush for test {Test}; the test likely loads no mutated assembly",
+            RunnerId, Path.GetFileName(assembly), test.Uid);
+        return (Array.Empty<int>(), Array.Empty<int>());
     }
 
     /// <summary>
@@ -809,7 +853,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
 
             // Bail applies only to mutation sessions (never the initial or coverage runs): once a
             // test genuinely fails the mutant is killed and the rest of the session proves nothing.
-            var bailPredicate = mutants is not null && update is not null ? BuildBailPredicate() : null;
+            var bailPredicate = mutants is not null ? BuildBailPredicate() : null;
 
             var accumulator = new TestRunAccumulator();
 
@@ -1013,12 +1057,14 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
 
         var failedTests = finishedTests
             .Where(x => TestNodeStates.IsFailure(x.Node.ExecutionState))
-            .Select(x => x.Node.Uid)
+            .Select(NormalizeToDiscoveredUid)
+            .Distinct()
             .ToList();
 
         var timedOutTests = finishedTests
             .Where(x => TestNodeStates.IsTimeout(x.Node.ExecutionState))
-            .Select(x => x.Node.Uid)
+            .Select(NormalizeToDiscoveredUid)
+            .Distinct()
             .ToList();
 
         lock (_discoveryLock)
@@ -1044,10 +1090,10 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         var messages = finishedTests.Select(x =>
             $"{x.Node.DisplayName}{Environment.NewLine}{Environment.NewLine}State: {x.Node.ExecutionState}");
 
-        var executedTestCount = finishedTests.Count;
-        var executedTests = totalDiscoveredTests > 0 && executedTestCount >= totalDiscoveredTests
+        var executedUids = finishedTests.Select(NormalizeToDiscoveredUid).Distinct().ToList();
+        var executedTests = totalDiscoveredTests > 0 && executedUids.Count >= totalDiscoveredTests
             ? TestIdentifierList.EveryTest()
-            : new TestIdentifierList(finishedTests.Select(x => x.Node.Uid));
+            : new TestIdentifierList(executedUids);
 
         var failedTestIds = new TestIdentifierList(failedTests);
         var timedOutTestIds = timedOutTests.Count == 0
@@ -1068,6 +1114,31 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             errorMessagesStr,
             messages,
             duration);
+    }
+
+    /// <summary>
+    /// Maps a run-time test node back to the discovered test it belongs to. Theories whose rows
+    /// only materialize at run time report row-level uids that discovery never saw; verdicts and
+    /// coverage are keyed by discovered uids, so an unmapped row would make its kill invisible
+    /// (row uid ∉ any assessing set). The MTP protocol links each update to its parent node, and
+    /// the parent of a run-time-expanded row is the discovered theory method.
+    /// </summary>
+    private string NormalizeToDiscoveredUid(TestNodeUpdate update)
+    {
+        lock (_discoveryLock)
+        {
+            if (_testDescriptions.ContainsKey(update.Node.Uid))
+            {
+                return update.Node.Uid;
+            }
+
+            if (!string.IsNullOrEmpty(update.ParentUid) && _testDescriptions.ContainsKey(update.ParentUid))
+            {
+                return update.ParentUid;
+            }
+        }
+
+        return update.Node.Uid;
     }
 
     public void Dispose()
