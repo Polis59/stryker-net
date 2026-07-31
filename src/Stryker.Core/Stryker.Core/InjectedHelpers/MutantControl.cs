@@ -12,8 +12,8 @@ namespace Stryker
         // process-wide sink shared through AppDomain data: with a private sink per copy, each
         // copy would overwrite the shared coverage file with only its own assembly's coverage,
         // and whichever copy flushed last would win, silently dropping the rest. The sink is an
-        // object[3]: covered-mutant list, covered-static-mutant list, and the lock guarding both.
-        // The lists are cleared in place, never reassigned, because every copy holds the same
+        // object[3]: covered-mutant set, covered-static-mutant set, and the lock guarding both.
+        // The sets are cleared in place, never reassigned, because every copy holds the same
         // references. Interned strings give a process-global identity to synchronize creation on.
         // Initialized to an empty sentinel (never null, for nullable-enabled consumers); the real
         // three-element sink replaces it on first use.
@@ -22,6 +22,8 @@ namespace Stryker
         // Initialized to avoid nullable warnings/errors
         private static string _cachedMutantFilePath = string.Empty;
         private static bool _mutantFilePathCached;
+        // True once the active mutant id has been read from the control file; see IsActive.
+        private static bool _fileMutantValueCached;
 
         // Memory-mapped view of the mutant-id file used by the MTP runner. The runner writes the active
         // mutant id (a 4-byte int) to the file between runs; reading it through a memory-mapped view is a
@@ -116,8 +118,8 @@ namespace Stryker
                 {
                     sink = new object[]
                     {
-                        new System.Collections.Generic.List<int>(),
-                        new System.Collections.Generic.List<int>(),
+                        new System.Collections.Generic.HashSet<int>(),
+                        new System.Collections.Generic.HashSet<int>(),
                         new System.Object()
                     };
                     System.AppDomain.CurrentDomain.SetData("Stryker.MutantControl.CoverageSink.v1", sink);
@@ -260,14 +262,30 @@ namespace Stryker
             lock (sink[2])
             {
                 // Clear in place: every injected copy holds references to these same lists.
-                ((System.Collections.Generic.List<int>)sink[0]).Clear();
-                ((System.Collections.Generic.List<int>)sink[1]).Clear();
+                ((System.Collections.Generic.HashSet<int>)sink[0]).Clear();
+                ((System.Collections.Generic.HashSet<int>)sink[1]).Clear();
             }
         }
 
         public static void ResetActiveMutant()
         {
             ActiveMutant = ActiveMutantNotInitValue;
+        }
+
+        /// <summary>
+        /// Re-reads the active mutant id from the control file and refreshes the cached value.
+        /// The activation sink in the test framework calls this (via reflection, on every
+        /// injected copy) at the start of each run request and after each per-test switch;
+        /// between those moments IsActive compares against the cached value only.
+        /// </summary>
+        public static void RefreshActiveMutantFromFile()
+        {
+            int fileMutantId;
+            if (TryReadMutantFromFile(out fileMutantId))
+            {
+                ActiveMutant = fileMutantId;
+                _fileMutantValueCached = true;
+            }
         }
 
         public static void SetActiveMutantViaEnvironmentVariable(int mutantId)
@@ -405,10 +423,10 @@ namespace Stryker
             System.Collections.Generic.List<int> coveredStatic;
             lock (sink[2])
             {
-                covered = new System.Collections.Generic.List<int>((System.Collections.Generic.List<int>)sink[0]);
-                coveredStatic = new System.Collections.Generic.List<int>((System.Collections.Generic.List<int>)sink[1]);
-                ((System.Collections.Generic.List<int>)sink[0]).Clear();
-                ((System.Collections.Generic.List<int>)sink[1]).Clear();
+                covered = new System.Collections.Generic.List<int>((System.Collections.Generic.HashSet<int>)sink[0]);
+                coveredStatic = new System.Collections.Generic.List<int>((System.Collections.Generic.HashSet<int>)sink[1]);
+                ((System.Collections.Generic.HashSet<int>)sink[0]).Clear();
+                ((System.Collections.Generic.HashSet<int>)sink[1]).Clear();
             }
 
             return new System.Collections.Generic.IList<int>[] { covered, coveredStatic };
@@ -443,12 +461,12 @@ namespace Stryker
                 object[] sink = GetSharedCoverageSink();
                 lock (sink[2])
                 {
-                    string covered = string.Join(",", (System.Collections.Generic.List<int>)sink[0]);
-                    string staticMutants = string.Join(",", (System.Collections.Generic.List<int>)sink[1]);
+                    string covered = string.Join(",", (System.Collections.Generic.HashSet<int>)sink[0]);
+                    string staticMutants = string.Join(",", (System.Collections.Generic.HashSet<int>)sink[1]);
                     string content = covered + ";" + staticMutants;
                     System.IO.File.WriteAllText(_cachedCoverageFilePath, content);
-                    ((System.Collections.Generic.List<int>)sink[0]).Clear();
-                    ((System.Collections.Generic.List<int>)sink[1]).Clear();
+                    ((System.Collections.Generic.HashSet<int>)sink[0]).Clear();
+                    ((System.Collections.Generic.HashSet<int>)sink[1]).Clear();
                 }
             }
             catch (System.Exception ex)
@@ -467,14 +485,25 @@ namespace Stryker
                 return false;
             }
 
-            // Check for file-based mutant control (used by MTP runner for process reuse)
-            // Cache check: only call TryReadMutantFromFile if we might be using file-based control
+            // Check for file-based mutant control (used by MTP runner for process reuse).
+            // The file is read once and cached: IsActive executes at every mutation point,
+            // millions of times per test, and a per-call memory-mapped read multiplies every
+            // test's cost several-fold across an entire campaign. The activation sink in the
+            // test framework owns invalidation instead - it calls
+            // RefreshActiveMutantFromFile at the start of every run request and after every
+            // per-test switch, which are the only moments the file legitimately changes for a
+            // live test host. A freshly loaded copy (for example in a new collectible context)
+            // reads the file on its first call and keeps that value for the context's life.
             if (!_mutantFilePathCached || !string.IsNullOrEmpty(_cachedMutantFilePath))
             {
-                int fileMutantId;
-                if (TryReadMutantFromFile(out fileMutantId))
+                if (!_fileMutantValueCached)
                 {
-                    ActiveMutant = fileMutantId;
+                    int fileMutantId;
+                    if (TryReadMutantFromFile(out fileMutantId))
+                    {
+                        ActiveMutant = fileMutantId;
+                        _fileMutantValueCached = true;
+                    }
                 }
 
                 // If we cached the file path and it's set, always use file-based control
@@ -515,14 +544,11 @@ namespace Stryker
             object[] sink = GetSharedCoverageSink();
             lock (sink[2])
             {
-                System.Collections.Generic.List<int> covered = (System.Collections.Generic.List<int>)sink[0];
-                if (!covered.Contains(id))
+                System.Collections.Generic.HashSet<int> covered = (System.Collections.Generic.HashSet<int>)sink[0];
+                covered.Add(id);
+                if (MutantContext.InStatic())
                 {
-                    covered.Add(id);
-                }
-                System.Collections.Generic.List<int> coveredStatic = (System.Collections.Generic.List<int>)sink[1];
-                if (MutantContext.InStatic() && !coveredStatic.Contains(id))
-                {
+                    System.Collections.Generic.HashSet<int> coveredStatic = (System.Collections.Generic.HashSet<int>)sink[1];
                     coveredStatic.Add(id);
                 }
             }

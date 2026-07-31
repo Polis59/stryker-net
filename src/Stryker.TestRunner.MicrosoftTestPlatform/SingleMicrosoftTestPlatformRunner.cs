@@ -292,6 +292,10 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             mutants.Select(mutant => mutant.Id).ToList(),
             GetAssessingTestCount(mutants));
 
+        var batchStopwatch = Stopwatch.StartNew();
+        var waveCount = 0;
+        var waveTestCount = 0;
+        var confirmationCount = 0;
         var hadRuntimeIssue = false;
         var hadTimeout = false;
         try
@@ -364,6 +368,8 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                     break;
                 }
 
+                waveCount++;
+                waveTestCount += assignments.Count;
                 var waveOutcome = await RunWaveAsync(assemblies, assignments, timeoutCalc).ConfigureAwait(false);
                 hadTimeout |= waveOutcome.TimedOut;
                 hadRuntimeIssue |= waveOutcome.HadRuntimeIssue;
@@ -396,6 +402,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             // failed wave left unresolved: prove the verdict cold in a collectible context.
             foreach (var state in states.Where(s => s.Unresolved))
             {
+                confirmationCount++;
                 var result = await RunAllTestsAsync(
                     assemblies,
                     state.Mutant.Id,
@@ -443,6 +450,9 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         }
         finally
         {
+            _logger.LogInformation(
+                "{RunnerId}: BATCHTIME mutants={Mutants} waves={Waves} waveTests={WaveTests} confirmations={Confirmations} ms={ElapsedMs}",
+                RunnerId, mutants.Count, waveCount, waveTestCount, confirmationCount, batchStopwatch.ElapsedMilliseconds);
             MutationCampaignProgressReporter.OrdinaryBatchCompleted(
                 RunnerId,
                 mutants.Count,
