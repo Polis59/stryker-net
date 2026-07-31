@@ -316,7 +316,7 @@ public class AssemblyTestServerTests
         var listener = new TestNodeUpdatesResponseListener(Guid.NewGuid(), _ => Task.CompletedTask);
         listener.Complete();
 
-        _clientMock.Setup(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), null, It.IsAny<TimeSpan?>()))
+        _clientMock.Setup(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), null, It.IsAny<TimeSpan?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(listener);
 
         using var server = CreateServer();
@@ -324,7 +324,7 @@ public class AssemblyTestServerTests
         var result = await server.RunTestsAsync(null);
 
         result.ShouldNotBeNull();
-        _clientMock.Verify(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), null, It.IsAny<TimeSpan?>()), Times.Once);
+        _clientMock.Verify(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), null, It.IsAny<TimeSpan?>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [TestMethod]
@@ -336,14 +336,14 @@ public class AssemblyTestServerTests
         var listener = new TestNodeUpdatesResponseListener(Guid.NewGuid(), _ => Task.CompletedTask);
         listener.Complete();
 
-        _clientMock.Setup(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), testNodes, It.IsAny<TimeSpan?>()))
+        _clientMock.Setup(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), testNodes, It.IsAny<TimeSpan?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(listener);
 
         using var server = CreateServer();
         await server.StartAsync();
         await server.RunTestsAsync(testNodes);
 
-        _clientMock.Verify(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), testNodes, It.IsAny<TimeSpan?>()), Times.Once);
+        _clientMock.Verify(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), testNodes, It.IsAny<TimeSpan?>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [TestMethod]
@@ -359,8 +359,8 @@ public class AssemblyTestServerTests
             new TestNodeUpdate(failedNode, "parent")
         };
 
-        _clientMock.Setup(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), null, It.IsAny<TimeSpan?>()))
-            .Returns<Guid, Func<TestNodeUpdate[], Task>, TestNode[]?, TimeSpan?>(async (id, callback, _, _) =>
+        _clientMock.Setup(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), null, It.IsAny<TimeSpan?>(), It.IsAny<CancellationToken>()))
+            .Returns<Guid, Func<TestNodeUpdate[], Task>, TestNode[]?, TimeSpan?, CancellationToken>(async (id, callback, _, _, _) =>
             {
                 await callback(updates);
                 var listener = new TestNodeUpdatesResponseListener(id, _ => Task.CompletedTask);
@@ -385,7 +385,7 @@ public class AssemblyTestServerTests
         var listener = new TestNodeUpdatesResponseListener(Guid.NewGuid(), _ => Task.CompletedTask);
         listener.Complete();
 
-        _clientMock.Setup(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), null, It.IsAny<TimeSpan?>()))
+        _clientMock.Setup(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), null, It.IsAny<TimeSpan?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(listener);
 
         using var server = CreateServer();
@@ -403,7 +403,7 @@ public class AssemblyTestServerTests
         // Listener that never completes
         var listener = new TestNodeUpdatesResponseListener(Guid.NewGuid(), _ => Task.CompletedTask);
 
-        _clientMock.Setup(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), null, It.IsAny<TimeSpan?>()))
+        _clientMock.Setup(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), null, It.IsAny<TimeSpan?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(listener);
 
         using var server = CreateServer();
@@ -420,7 +420,7 @@ public class AssemblyTestServerTests
 
         // Listener that never completes (a crashed host never sends a completion signal)
         var listener = new TestNodeUpdatesResponseListener(Guid.NewGuid(), _ => Task.CompletedTask);
-        _clientMock.Setup(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), null, It.IsAny<TimeSpan?>()))
+        _clientMock.Setup(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), null, It.IsAny<TimeSpan?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(listener);
 
         using var server = CreateServer();
@@ -441,7 +441,7 @@ public class AssemblyTestServerTests
         SetupSuccessfulConnection();
 
         var listener = new TestNodeUpdatesResponseListener(Guid.NewGuid(), _ => Task.CompletedTask);
-        _clientMock.Setup(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), null, It.IsAny<TimeSpan?>()))
+        _clientMock.Setup(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), null, It.IsAny<TimeSpan?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(listener);
 
         using var server = CreateServer();
@@ -460,7 +460,7 @@ public class AssemblyTestServerTests
         SetupSuccessfulConnection();
 
         // RPC call that never returns (simulates server stuck in infinite loop)
-        _clientMock.Setup(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), null, It.IsAny<TimeSpan?>()))
+        _clientMock.Setup(c => c.RunTestsAsync(It.IsAny<Guid>(), It.IsAny<Func<TestNodeUpdate[], Task>>(), null, It.IsAny<TimeSpan?>(), It.IsAny<CancellationToken>()))
             .Returns(new TaskCompletionSource<ResponseListener>().Task);
 
         using var server = CreateServer();

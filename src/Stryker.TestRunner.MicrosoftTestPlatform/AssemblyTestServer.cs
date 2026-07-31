@@ -245,7 +245,7 @@ internal sealed class AssemblyTestServer : IDisposable
             }
 
             var completionTask = executeTestsResponse.WaitCompletionAsync(timeout.Value, bailSource.Token);
-            await Task.WhenAny(completionTask, _process!.WaitForExitAsync()).ConfigureAwait(false);
+            await Task.WhenAny(completionTask, HostExitAsync()).ConfigureAwait(false);
             if (bailed)
             {
                 return (testResults.ToList(), false);
@@ -284,7 +284,7 @@ internal sealed class AssemblyTestServer : IDisposable
         }
 
         var responseCompletion = response.WaitCompletionAsync();
-        await Task.WhenAny(responseCompletion, _process!.WaitForExitAsync()).ConfigureAwait(false);
+        await Task.WhenAny(responseCompletion, HostExitAsync()).ConfigureAwait(false);
         if (bailed)
         {
             return (testResults.ToList(), false);
@@ -303,6 +303,14 @@ internal sealed class AssemblyTestServer : IDisposable
     /// run completed. A crashed host never sends a completion signal, so without this check the run would
     /// otherwise wait out the full timeout and be misreported as a timeout instead of a runtime error.
     /// </summary>
+    /// <summary>
+    /// A task that completes when the test host process exits, or never when the server
+    /// runs without a real process (unit-test doubles drive `RunTestsAsync` directly).
+    /// The crash race in <see cref="ThrowIfHostCrashed"/> is likewise process-optional.
+    /// </summary>
+    private Task HostExitAsync() =>
+        _process?.WaitForExitAsync() ?? new TaskCompletionSource().Task;
+
     private void ThrowIfHostCrashed(Task runCompletion)
     {
         if (_process is { HasExited: true } && !runCompletion.IsCompletedSuccessfully)
