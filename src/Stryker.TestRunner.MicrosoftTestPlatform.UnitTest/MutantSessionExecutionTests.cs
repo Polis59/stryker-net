@@ -64,10 +64,11 @@ public class MutantSessionExecutionTests
         // Act
         await runner.TestMultipleMutantsAsync(CreateProject().Object, null, mutants, (_, _, _, _) => true);
 
-        // Assert: one session per mutant, each with that mutant's mutation active. The previous
-        // behaviour published mutant id -1 for any group larger than one, so the group's tests
-        // all ran against unmutated code.
-        runner.Sessions.Select(s => s.ActiveMutantId).ShouldBe([11, 22]);
+        // Assert: sessions activate each mutant's own mutation. The previous behaviour published
+        // mutant id -1 for any group larger than one, so the group's tests all ran against
+        // unmutated code. Each mutant appears twice because a warm-host non-detection is
+        // confirmed once on a fresh host before Survived is accepted.
+        runner.Sessions.Select(s => s.ActiveMutantId).ShouldBe([11, 11, 22, 22]);
     }
 
     [TestMethod, Timeout(5000)]
@@ -80,8 +81,13 @@ public class MutantSessionExecutionTests
         // Act
         await runner.TestMultipleMutantsAsync(CreateProject().Object, null, [mutant.Object], (_, _, _, _) => true);
 
-        // Assert
-        runner.Sessions.ShouldHaveSingleItem().TargetedUids.ShouldBe(["test-b", "test-c"]);
+        // Assert: both the warm pass and the fresh-host confirmation stay restricted to the
+        // mutant's assessing tests.
+        runner.Sessions.Count.ShouldBe(2);
+        foreach (var session in runner.Sessions)
+        {
+            session.TargetedUids.ShouldBe(["test-b", "test-c"]);
+        }
     }
 
     [TestMethod, Timeout(5000)]
@@ -99,8 +105,35 @@ public class MutantSessionExecutionTests
 
         // Assert: once before the static mutant (its static initializers must execute with the
         // mutation already active) and once before the following ordinary mutant (the static
-        // mutant's initializer side effects persist in the warm host).
+        // mutant's initializer side effects persist in the reused host). Neither mutant needs a
+        // survival confirmation because both already ran on fresh hosts.
         runner.ServerResets.ShouldBe(2);
+    }
+
+    [TestMethod, Timeout(5000)]
+    public async Task TestMultipleMutantsAsync_ConfirmsAWarmSurvivorOnAFreshHost_AndKeepsAFreshKill()
+    {
+        // Arrange: the mutant's assessing test passes on the warm host (the mutated path is
+        // hidden behind warmed caches) and fails on the fresh-host confirmation.
+        using var runner = CreateRunner(35, "test-a");
+        var mutant = CreateMutant(9);
+        runner.FailingUidsByMutantIdOnFreshHost[9] = ["test-a"];
+        var updates = new List<string[]>();
+
+        // Act
+        await runner.TestMultipleMutantsAsync(
+            CreateProject().Object, null, [mutant.Object],
+            (_, failed, _, _) =>
+            {
+                updates.Add(failed.GetIdentifiers().ToArray());
+                return true;
+            });
+
+        // Assert: the handler saw only the confirmed (fresh-host) result, so the mutant is
+        // killed, not misreported as survived from the warm pass.
+        runner.Sessions.Count.ShouldBe(2);
+        runner.ServerResets.ShouldBe(1);
+        updates.ShouldHaveSingleItem().ShouldBe(["test-a"]);
     }
 
     [TestMethod, Timeout(5000)]
@@ -141,7 +174,15 @@ public class MutantSessionExecutionTests
 
         public Dictionary<int, string[]> FailingUidsByMutantId { get; } = [];
 
+        // Fails the mutant's tests only when the session runs on a "fresh" host (one reset since
+        // the previous session) — models a kill hidden behind warm-host caches.
+        public Dictionary<int, string[]> FailingUidsByMutantIdOnFreshHost { get; } = [];
+
         public int ServerResets { get; private set; }
+
+        // Starts false so the first session models a warm host; ResetServerAsync marks the next
+        // session fresh.
+        private bool _freshHost;
 
         public RecordingRunner(
             int id,
@@ -155,6 +196,7 @@ public class MutantSessionExecutionTests
         public override Task ResetServerAsync()
         {
             ServerResets++;
+            _freshHost = true;
             return Task.CompletedTask;
         }
 
@@ -167,6 +209,11 @@ public class MutantSessionExecutionTests
             Sessions.Add((assembly, activeMutantId, targeted?.Select(t => t.Uid).ToArray()));
 
             var failingUids = FailingUidsByMutantId.TryGetValue(activeMutantId, out var uids) ? uids : [];
+            if (_freshHost && FailingUidsByMutantIdOnFreshHost.TryGetValue(activeMutantId, out var freshUids))
+            {
+                failingUids = freshUids;
+            }
+            _freshHost = false;
             var result = new TestRunResult(
                 Array.Empty<IFrameworkTestDescription>(),
                 new TestIdentifierList(targeted?.Select(t => t.Uid) ?? []),
