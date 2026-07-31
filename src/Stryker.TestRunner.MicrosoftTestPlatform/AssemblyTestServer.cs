@@ -142,6 +142,8 @@ internal sealed class AssemblyTestServer : IDisposable
         }
 
         var runId = Guid.NewGuid();
+        var stageStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        long firstUpdateMs = -1;
         var testResults = new System.Collections.Concurrent.ConcurrentBag<TestNodeUpdate>();
 
         // Bail: when a streamed update proves the session's mutant is already killed, cancel the
@@ -153,6 +155,11 @@ internal sealed class AssemblyTestServer : IDisposable
 
         Func<TestNodeUpdate[], Task> onUpdate = updates =>
         {
+            if (firstUpdateMs < 0)
+            {
+                firstUpdateMs = stageStopwatch.ElapsedMilliseconds;
+            }
+
             foreach (var update in updates)
             {
                 testResults.Add(update);
@@ -205,6 +212,8 @@ internal sealed class AssemblyTestServer : IDisposable
             ThrowIfHostCrashed(completionTask);
 
             var completed = await completionTask.ConfigureAwait(false);
+            _logger.LogInformation("{RunnerId}: RUNSTAGE firstUpdateMs={FirstUpdate} totalMs={Total} results={Results}",
+                _runnerId, firstUpdateMs, stageStopwatch.ElapsedMilliseconds, testResults.Count);
             return (testResults.ToList(), !completed);
         }
 
@@ -228,6 +237,8 @@ internal sealed class AssemblyTestServer : IDisposable
         ThrowIfHostCrashed(responseCompletion);
 
         await responseCompletion.ConfigureAwait(false);
+        _logger.LogInformation("{RunnerId}: RUNSTAGE firstUpdateMs={FirstUpdate} totalMs={Total} results={Results}",
+            _runnerId, firstUpdateMs, stageStopwatch.ElapsedMilliseconds, testResults.Count);
         return (testResults.ToList(), false);
     }
 

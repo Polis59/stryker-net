@@ -10,6 +10,16 @@ namespace Stryker.TestRunner.MicrosoftTestPlatform;
 /// </summary>
 public static class MutationBatchPlanner
 {
+    /// <summary>
+    /// Upper bound on the union assessing-test count of a packed multi-mutant batch.
+    /// A packed batch multiplexes mutants through one request via the per-test
+    /// activation map, which forces serialized execution; the serial per-test cost
+    /// keeps a batch at this bound to a few seconds. A mutant whose own set exceeds
+    /// the bound goes to a singleton batch instead, where the runner activates it
+    /// for the whole session and the host keeps its normal parallel execution.
+    /// </summary>
+    private const int MaximumSerialSessionTests = 256;
+
     public static IEnumerable<List<IMutant>> Build(
         IStrykerOptions options,
         IReadOnlyCollection<IMutant> mutantsNotRun)
@@ -44,21 +54,11 @@ public static class MutationBatchPlanner
                 .Select(mutant => new List<IMutant> { mutant }));
         remaining.RemoveAll(RequiresProcessIsolation);
 
-        if (options.TestRunner == Stryker.Abstractions.Options.TestRunner.MicrosoftTestPlatform)
-        {
-            // The MTP runner executes each batch in waves: every wave publishes a fresh
-            // test-to-mutant activation map, so disjoint assessing sets are only required inside
-            // one wave request, never across a whole batch — a shared test simply serves its
-            // mutants in successive waves. Disjoint packing would fragment hub-covered mutants
-            // into thousands of tiny batches, each paying a full fixture initialization; even
-            // chunks sized to keep every runner busy pay it a handful of times in total.
-            var chunkCount = Math.Max(1, options.Concurrency * 2);
-            var chunkSize = Math.Max(1, (remaining.Count + chunkCount - 1) / chunkCount);
-            groups.AddRange(remaining.Chunk(chunkSize).Select(chunk => chunk.ToList()));
-
-            ReportPlan(groups);
-            return groups;
-        }
+        groups.AddRange(
+            remaining
+                .Where(mutant => mutant.AssessingTests.Count > MaximumSerialSessionTests)
+                .Select(mutant => new List<IMutant> { mutant }));
+        remaining.RemoveAll(mutant => mutant.AssessingTests.Count > MaximumSerialSessionTests);
 
         remaining = remaining
             .OrderBy(mutant => mutant.AssessingTests.Count)
@@ -67,12 +67,22 @@ public static class MutationBatchPlanner
         while (remaining.Count > 0)
         {
             var assessingTests = remaining[0].AssessingTests;
+            var unionTestCount = remaining[0].AssessingTests.Count;
             var group = new List<IMutant> { remaining[0] };
             remaining.RemoveAt(0);
 
             for (var index = 0; index < remaining.Count; index++)
             {
                 var candidate = remaining[index];
+
+                // Candidates are ordered by ascending set size, so the first one
+                // that would push the disjoint union past the serial bound proves
+                // every later candidate would too.
+                if (unionTestCount + candidate.AssessingTests.Count > MaximumSerialSessionTests)
+                {
+                    break;
+                }
+
                 if (candidate.AssessingTests.ContainsAny(assessingTests))
                 {
                     continue;
@@ -81,6 +91,7 @@ public static class MutationBatchPlanner
                 group.Add(candidate);
                 remaining.RemoveAt(index--);
                 assessingTests = assessingTests.Merge(candidate.AssessingTests);
+                unionTestCount += candidate.AssessingTests.Count;
             }
 
             groups.Add(group);

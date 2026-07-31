@@ -496,13 +496,17 @@ namespace Stryker
             // reads the file on its first call and keeps that value for the context's life.
             if (!_mutantFilePathCached || !string.IsNullOrEmpty(_cachedMutantFilePath))
             {
+                // The cached fast path only engages after the test framework's activation sink
+                // has called RefreshActiveMutantFromFile at least once: that call proves a
+                // refresher exists to invalidate the cache at request starts and per-test
+                // switches. Without one (an older activation sink), every call reads the file,
+                // which is what keeps per-test switching correct there.
                 if (!_fileMutantValueCached)
                 {
                     int fileMutantId;
                     if (TryReadMutantFromFile(out fileMutantId))
                     {
                         ActiveMutant = fileMutantId;
-                        _fileMutantValueCached = true;
                     }
                 }
 
