@@ -13,4 +13,3 @@ public sealed class MtpTestResult : ITestResult
 
     public TimeSpan Duration { get; }
 }
-

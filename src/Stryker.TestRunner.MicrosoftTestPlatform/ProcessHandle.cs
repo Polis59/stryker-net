@@ -55,7 +55,7 @@ public class ProcessHandle(CommandTask<CommandResult> commandTask, Stream output
     {
         return Task.CompletedTask;
     }
-    
+
     public void Dispose()
     {
         Dispose(true);
@@ -95,7 +95,7 @@ public class ProcessHandle(CommandTask<CommandResult> commandTask, Stream output
                 // Task may still not be in a completion state after kill
             }
         }
-        
+
         _disposed = true;
     }
 }

@@ -78,7 +78,12 @@ namespace Stryker
                 // election and owns both the exit-time flush and the flush-request watcher. All
                 // copies still register coverage into the shared sink, so the elected writer
                 // flushes everything.
-                if (TryElectCoverageWriter())
+                // Lifecycle coverage (STRYKER_COVERAGE_MAP_FILE) drains the counters after every
+                // test instead, and a process-exit callback would pin a collectible test load
+                // context for the lifetime of the isolation broker, so neither the exit flush nor
+                // the watcher is registered while that protocol is active.
+                string coverageMapFile = System.Environment.GetEnvironmentVariable("STRYKER_COVERAGE_MAP_FILE") ?? string.Empty;
+                if (string.IsNullOrEmpty(coverageMapFile) && TryElectCoverageWriter())
                 {
                     if (!_processExitRegistered)
                     {
