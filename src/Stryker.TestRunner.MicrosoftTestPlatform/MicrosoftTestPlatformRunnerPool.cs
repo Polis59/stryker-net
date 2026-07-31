@@ -132,7 +132,34 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
         return CaptureAggregateCoverage(project);
     }
 
+    // Coverage is a property of the test suite, not of the source project under mutation, yet in
+    // solution mode every source project's mutation-test process asks for it. Cache the sweep per
+    // test-assembly set so the suite runs once instead of once per source project.
+    private readonly object _coverageCacheLock = new();
+    private (string Key, List<ICoverageRunResult> Results)? _perTestCoverageCache;
+
     private IEnumerable<ICoverageRunResult> CaptureCoveragePerTest(IProjectAndTests project)
+    {
+        var cacheKey = string.Join(";", project.GetTestAssemblies().OrderBy(a => a, StringComparer.OrdinalIgnoreCase));
+        lock (_coverageCacheLock)
+        {
+            if (_perTestCoverageCache is { } cached && cached.Key == cacheKey)
+            {
+                _logger.LogInformation("Reusing per-test mutation coverage captured earlier for the same test assemblies");
+                return cached.Results;
+            }
+        }
+
+        var captured = CaptureCoveragePerTestUncached(project);
+        lock (_coverageCacheLock)
+        {
+            _perTestCoverageCache = (cacheKey, captured);
+        }
+
+        return captured;
+    }
+
+    private List<ICoverageRunResult> CaptureCoveragePerTestUncached(IProjectAndTests project)
     {
         _logger.LogInformation("Capturing per-test mutation coverage on persistent test hosts");
 
