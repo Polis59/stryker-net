@@ -41,13 +41,15 @@ internal sealed class CollectibleTestIsolationClient : IDisposable
         try
         {
             await EnsureStartedAsync().ConfigureAwait(false);
-            // A collectible context always assesses one whole-context-activated mutant, so its
-            // tests may run with xUnit's normal collection parallelism.
+            // Serial execution inside the context is deliberate: parallel test collections in the
+            // in-proc runner intermittently hang the broker until the response window expires
+            // (observed as mass request-timeout host restarts), and the exact-coverage isolation
+            // sets are small enough that serial execution is not the bottleneck.
             var request = new CollectibleIsolationRequest(
                 assembly,
                 testCaseIds,
                 Shutdown: false,
-                Parallel: true);
+                Parallel: false);
             await writer!.WriteLineAsync(
                 JsonSerializer.Serialize(request, SerializerOptions))
                 .ConfigureAwait(false);

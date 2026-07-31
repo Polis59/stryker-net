@@ -44,6 +44,22 @@ public static class MutationBatchPlanner
                 .Select(mutant => new List<IMutant> { mutant }));
         remaining.RemoveAll(RequiresProcessIsolation);
 
+        if (options.TestRunner == Stryker.Abstractions.Options.TestRunner.MicrosoftTestPlatform)
+        {
+            // The MTP runner executes each batch in waves: every wave publishes a fresh
+            // test-to-mutant activation map, so disjoint assessing sets are only required inside
+            // one wave request, never across a whole batch — a shared test simply serves its
+            // mutants in successive waves. Disjoint packing would fragment hub-covered mutants
+            // into thousands of tiny batches, each paying a full fixture initialization; even
+            // chunks sized to keep every runner busy pay it a handful of times in total.
+            var chunkCount = Math.Max(1, options.Concurrency * 2);
+            var chunkSize = Math.Max(1, (remaining.Count + chunkCount - 1) / chunkCount);
+            groups.AddRange(remaining.Chunk(chunkSize).Select(chunk => chunk.ToList()));
+
+            ReportPlan(groups);
+            return groups;
+        }
+
         remaining = remaining
             .OrderBy(mutant => mutant.AssessingTests.Count)
             .ToList();

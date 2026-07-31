@@ -164,7 +164,10 @@ public sealed class RunnerLifecycleTests
             ],
             null);
 
-        Assert.Equal(["isolate:/test.dll", "run:/test.dll"], runner.Events);
+        // The static mutant runs first in its collectible context (inactive map, whole-context
+        // activation), the ordinary mutant's wave runs on the reusable host with the per-test
+        // map, and its non-detection is then confirmed in a fresh collectible context.
+        Assert.Equal(["isolate:/test.dll", "run:/test.dll", "isolate:/test.dll"], runner.Events);
         Assert.Equal(
             "threadway-stryker-map-v1\toff",
             runner.MutantMapHeaders[0]);
@@ -172,11 +175,14 @@ public sealed class RunnerLifecycleTests
             "threadway-stryker-map-v1\tactive\t",
             runner.MutantMapHeaders[1],
             StringComparison.Ordinal);
+        Assert.Equal(
+            "threadway-stryker-map-v1\toff",
+            runner.MutantMapHeaders[2]);
         Assert.Equal(5, runner.LastMutantAssignments["wanted"]);
     }
 
     [Fact]
-    public async Task OrdinaryMutantReusesTheExistingHost()
+    public async Task OrdinaryEveryTestMutantRunsInACollectibleContext()
     {
         using var runner = new SessionTrackingRunner();
 
@@ -186,9 +192,11 @@ public sealed class RunnerLifecycleTests
             [CreateMutant(5)],
             null);
 
-        Assert.Equal(["run:/test.dll"], runner.Events);
+        // A mutant assessed by every test has no wave slices to spend; it is settled directly in
+        // a fresh collectible context, where a cache computed by earlier warm sessions cannot
+        // hide the mutated path and the whole-context activation covers static initialization.
+        Assert.Equal(["isolate:/test.dll"], runner.Events);
         Assert.Equal([5], runner.ActiveMutantIds);
-        Assert.Equal(-1, runner.ReadMutantFile());
     }
 
     [Fact]
@@ -209,11 +217,13 @@ public sealed class RunnerLifecycleTests
             ],
             null);
 
-        Assert.Equal(["run:/test.dll"], runner.Events);
-        Assert.Equal([-1], runner.ActiveMutantIds);
+        // One wave request advances both mutants (id -1, per-test map switching); the two
+        // non-detections are then each confirmed in a fresh collectible context.
+        Assert.Equal(["run:/test.dll", "isolate:/test.dll", "isolate:/test.dll"], runner.Events);
+        Assert.Equal([-1, 1, 2], runner.ActiveMutantIds);
         Assert.Equal(1, runner.LastMutantAssignments["wanted"]);
         Assert.Equal(2, runner.LastMutantAssignments["other"]);
-        Assert.Equal(["other", "wanted"], runner.FilteredTestIds.Order());
+        Assert.Equal(["other", "wanted"], runner.FilteredTestIds.Take(2).Order());
     }
 
     [Fact]
@@ -238,17 +248,19 @@ public sealed class RunnerLifecycleTests
             ],
             null);
 
+        // The static mutant isolates alone; the two ordinary mutants still share one wave
+        // request on the reusable host before their survival confirmations.
         Assert.Equal(
-            ["isolate:/test.dll", "run:/test.dll"],
+            ["isolate:/test.dll", "run:/test.dll", "isolate:/test.dll", "isolate:/test.dll"],
             runner.Events);
-        Assert.Equal([7, -1], runner.ActiveMutantIds);
+        Assert.Equal([7, -1, 5, 6], runner.ActiveMutantIds);
         Assert.Equal(5, runner.LastMutantAssignments["wanted"]);
         Assert.Equal(6, runner.LastMutantAssignments["other"]);
-        Assert.Equal(["other", "wanted"], runner.FilteredTestIds.Order());
+        Assert.Equal(["other", "wanted"], runner.FilteredTestIds.Take(2).Order());
     }
 
     [Fact]
-    public async Task MixedMutantRequestRejectsOverlappingTestAssignments()
+    public async Task MutantsSharingATestRunItInSuccessiveWaves()
     {
         var options = new Mock<IStrykerOptions>();
         options
@@ -256,7 +268,7 @@ public sealed class RunnerLifecycleTests
             .Returns(OptimizationModes.CoverageBasedTest);
         using var runner = new SessionTrackingRunner(options.Object);
 
-        var result = await runner.TestMultipleMutantsAsync(
+        await runner.TestMultipleMutantsAsync(
             CreateProject("/test.dll"),
             null,
             [
@@ -265,9 +277,13 @@ public sealed class RunnerLifecycleTests
             ],
             null);
 
-        Assert.True(result.SessionHadRuntimeIssue);
-        Assert.Contains("mapped to more than one mutant", result.ResultMessage);
-        Assert.Empty(runner.Events);
+        // Activation is keyed by test, so only one mutant per wave may own a test: the first
+        // wave runs the shared test for mutant 1, the second for mutant 2, and both
+        // non-detections are then confirmed in fresh collectible contexts.
+        Assert.Equal(
+            ["run:/test.dll", "run:/test.dll", "isolate:/test.dll", "isolate:/test.dll"],
+            runner.Events);
+        Assert.Equal(2, runner.LastMutantAssignments["shared"]);
     }
 
     [Fact]
@@ -285,7 +301,9 @@ public sealed class RunnerLifecycleTests
             [CreateMutant(3, assessingTests: new TestIdentifierList("wanted"))],
             null);
 
-        Assert.Equal(["wanted"], runner.FilteredTestIds);
+        // Both the wave request and the collectible confirmation stay restricted to the
+        // mutant's assessing tests.
+        Assert.Equal(["wanted", "wanted"], runner.FilteredTestIds);
     }
 
     [Fact]
@@ -310,14 +328,16 @@ public sealed class RunnerLifecycleTests
             CreateProject("/test.dll"),
             null,
             [
-                CreateMutant(7, assessingTests: new TestIdentifierList("theory-case", "ambiguous-a")),
-                CreateMutant(8, assessingTests: new TestIdentifierList("ambiguous-b")),
+                CreateMutant(7, assessingTests: new TestIdentifierList("theory-case")),
+                CreateMutant(8, assessingTests: new TestIdentifierList("ambiguous-a")),
+                CreateMutant(9, assessingTests: new TestIdentifierList("ambiguous-b")),
             ],
             null);
 
-        // The deferred theory's method key resolves its run-time rows to mutant 7;
-        // the method whose rows are split across two mutants publishes no key, so
-        // an expanded row of it still fails closed.
+        // All three tests share the first wave's map. The deferred theory's method key resolves
+        // its run-time rows to mutant 7; the method whose rows are assigned to two different
+        // mutants inside the same wave publishes no key, so an expanded row of it still fails
+        // closed.
         Assert.Equal(7, runner.LastMutantAssignments["method\tExample.VectorTests.PublishedVectors"]);
         Assert.DoesNotContain(
             "method\tExample.VectorTests.Shared",
@@ -622,7 +642,8 @@ public sealed class RunnerLifecycleTests
                 string assembly,
                 ITimeoutValueCalculator? timeoutCalc,
                 Func<TestNode, bool>? testUidFilter = null,
-                bool serialActivation = false)
+                bool serialActivation = false,
+                Func<TestNodeUpdate, bool>? bailPredicate = null)
         {
             return TrackRun(assembly, testUidFilter, "run");
         }
