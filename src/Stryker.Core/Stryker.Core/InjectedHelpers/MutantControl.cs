@@ -33,6 +33,20 @@ namespace Stryker
         private static bool _coverageFilePathCached;
         private static bool _processExitRegistered;
 
+        // Coverage flush control file for the MTP runner's per-test coverage capture. The file holds
+        // two 4-byte ints: a request sequence number at offset 0 (written by the runner) and an
+        // acknowledge sequence number at offset 4 (written by this process). After each single-test
+        // run the runner bumps the request number; a background watcher thread in this process
+        // flushes the coverage accumulated since the previous flush to the coverage file, then
+        // echoes the request number into the acknowledge slot so the runner knows the file is
+        // complete. This is what turns the exit-time coverage flush into a per-test protocol
+        // without restarting the test host between tests.
+        private static string _coverageControlFilePath = string.Empty;
+        // Roots the control-file mapping (typed as object for the C#2 constraint, like _mutantMmf):
+        // if the MemoryMappedFile were collected its finalizer would release the mapping handle out
+        // from under the accessor the watcher thread is still reading.
+        private static object _coverageControlMmf = new System.Object();
+
         // this attribute will be set by the Stryker Data Collector before each test
         public static bool CaptureCoverage;
         public static int ActiveMutant = -2;
@@ -57,6 +71,115 @@ namespace Stryker
                     System.AppDomain.CurrentDomain.ProcessExit += delegate { FlushCoverageToFile(); };
                     _processExitRegistered = true;
                 }
+
+                StartCoverageControlWatcher();
+            }
+        }
+
+        private static void StartCoverageControlWatcher()
+        {
+            // Environment variable contains only the filename; the runner puts the file in the temp
+            // directory, next to the coverage file. Absent variable means the runner is capturing
+            // aggregate coverage via the exit-time flush only, so no watcher is needed.
+            string controlFileName = System.Environment.GetEnvironmentVariable("STRYKER_COVERAGE_CONTROL_FILE") ?? string.Empty;
+            if (string.IsNullOrEmpty(controlFileName))
+            {
+                return;
+            }
+
+            _coverageControlFilePath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), controlFileName);
+
+            System.Threading.Thread watcher = new System.Threading.Thread(new System.Threading.ThreadStart(CoverageControlLoop));
+            watcher.IsBackground = true;
+            watcher.Name = "StrykerCoverageControlWatcher";
+            watcher.Start();
+        }
+
+        private static void CoverageControlLoop()
+        {
+            // Typed as object with a non-null sentinel (like _mutantAccessor above) so the injected
+            // source stays warning-free under nullable analysis; _mapped tells the two states apart.
+            object accessorHolder = new System.Object();
+            bool mapped = false;
+            int lastHandled = 0;
+
+            while (true)
+            {
+                try
+                {
+                    if (!mapped)
+                    {
+                        if (!System.IO.File.Exists(_coverageControlFilePath))
+                        {
+                            System.Threading.Thread.Sleep(50);
+                            continue;
+                        }
+
+                        // FileShare.ReadWrite lets the runner keep writing request numbers while this
+                        // process keeps the file mapped; leaveOpen: false ties the stream's lifetime
+                        // to the mapping.
+                        System.IO.FileStream stream = new System.IO.FileStream(
+                            _coverageControlFilePath,
+                            System.IO.FileMode.Open,
+                            System.IO.FileAccess.ReadWrite,
+                            System.IO.FileShare.ReadWrite);
+
+                        System.IO.MemoryMappedFiles.MemoryMappedFile mmf = System.IO.MemoryMappedFiles.MemoryMappedFile.CreateFromFile(
+                            stream,
+                            null,
+                            8,
+                            System.IO.MemoryMappedFiles.MemoryMappedFileAccess.ReadWrite,
+                            System.IO.HandleInheritability.None,
+                            false);
+
+                        System.IO.MemoryMappedFiles.MemoryMappedViewAccessor createdAccessor =
+                            mmf.CreateViewAccessor(0, 8, System.IO.MemoryMappedFiles.MemoryMappedFileAccess.ReadWrite);
+
+                        _coverageControlMmf = mmf;
+                        accessorHolder = createdAccessor;
+                        mapped = true;
+
+                        // Resume from the acknowledge slot rather than zero so a watcher restarted
+                        // after a transient mapping failure does not re-acknowledge (and re-reset)
+                        // coverage for a request that was already served.
+                        lastHandled = createdAccessor.ReadInt32(4);
+                    }
+
+                    System.IO.MemoryMappedFiles.MemoryMappedViewAccessor accessor =
+                        (System.IO.MemoryMappedFiles.MemoryMappedViewAccessor)accessorHolder;
+                    int requested = accessor.ReadInt32(0);
+                    if (requested != lastHandled)
+                    {
+                        // Write the coverage accumulated since the previous flush, then acknowledge.
+                        // Ordering matters: the runner only reads the coverage file after seeing the
+                        // acknowledge slot match its request number.
+                        FlushCoverageToFile();
+                        accessor.Write(4, requested);
+                        accessor.Flush();
+                        lastHandled = requested;
+                    }
+                }
+                catch (System.Exception)
+                {
+                    // The mapping became unusable (e.g. the runner deleted the file between runs);
+                    // drop it and retry, so a fresh control file re-establishes the protocol.
+                    if (mapped)
+                    {
+                        try
+                        {
+                            ((System.IDisposable)accessorHolder).Dispose();
+                        }
+                        catch (System.Exception)
+                        {
+                            // Nothing further to release.
+                        }
+                        accessorHolder = new System.Object();
+                        mapped = false;
+                    }
+                    System.Threading.Thread.Sleep(50);
+                }
+
+                System.Threading.Thread.Sleep(1);
             }
         }
 

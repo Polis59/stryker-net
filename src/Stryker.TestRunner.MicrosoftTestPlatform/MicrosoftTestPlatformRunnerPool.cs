@@ -92,6 +92,18 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
 
         var results = await RunThisAsync(runner => runner.InitialTestAsync(project)).ConfigureAwait(false);
 
+        // Bail must never trigger on a test that fails without any mutation, so every runner needs
+        // the initial run's failing tests. The EveryTest sentinel means the run itself broke; the
+        // campaign aborts on that, so there is nothing useful to record.
+        if (!results.FailingTests.IsEveryTest)
+        {
+            var initialFailing = results.FailingTests.GetIdentifiers().ToHashSet(StringComparer.Ordinal);
+            foreach (var runner in _allRunners)
+            {
+                runner.InitialRunFailingTests = initialFailing;
+            }
+        }
+
         // reset all test processes after the initial test run
         ResetTestProcesses();
 
@@ -99,6 +111,104 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
     }
 
     public IEnumerable<ICoverageRunResult> CaptureCoverage(IProjectAndTests project)
+    {
+        // Per-test coverage is what CoverageBasedTest ("perTest", the default) asks for: each
+        // mutant is then assessed only by the tests that actually cover it. The aggregate capture
+        // remains the fallback — it attributes every covered mutant to every test, which is safe
+        // but forces each mutation session to run the full suite.
+        if (_options.OptimizationMode.HasFlag(OptimizationModes.CoverageBasedTest))
+        {
+            try
+            {
+                return CaptureCoveragePerTest(project);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Per-test coverage capture failed; falling back to aggregate coverage (every test is assumed to cover every mutant).");
+            }
+        }
+
+        return CaptureAggregateCoverage(project);
+    }
+
+    private IEnumerable<ICoverageRunResult> CaptureCoveragePerTest(IProjectAndTests project)
+    {
+        _logger.LogInformation("Capturing per-test mutation coverage on persistent test hosts");
+
+        foreach (var runner in _allRunners)
+        {
+            runner.SetCoverageMode(true);
+        }
+
+        try
+        {
+            var results = new List<ICoverageRunResult>();
+
+            foreach (var assembly in project.GetTestAssemblies())
+            {
+                List<TestNode>? tests;
+                lock (_discoveryLock)
+                {
+                    _testsByAssembly.TryGetValue(assembly, out tests);
+                    tests = tests?.ToList();
+                }
+
+                if (tests is null || tests.Count == 0)
+                {
+                    continue;
+                }
+
+                // Partition the tests across the pool and let each slice hold one runner for its
+                // whole run: one blocking pool acquisition per runner, not one per test.
+                var slices = tests
+                    .Select((test, index) => (test, index))
+                    .GroupBy(pair => pair.index % _countOfRunners)
+                    .Select(group => group.Select(pair => pair.test).ToList())
+                    .ToList();
+
+                var sliceTasks = slices.Select(slice => RunThisAsync(async runner =>
+                {
+                    var sliceResults = new List<(string Uid, IReadOnlyList<int> Covered, IReadOnlyList<int> Statics)>(slice.Count);
+                    foreach (var test in slice)
+                    {
+                        var (covered, statics) = await runner.CaptureTestCoverageAsync(assembly, test).ConfigureAwait(false);
+                        sliceResults.Add((test.Uid, covered, statics));
+                    }
+
+                    return sliceResults;
+                })).ToArray();
+
+                foreach (var (uid, covered, statics) in Task.WhenAll(sliceTasks).GetAwaiter().GetResult().SelectMany(r => r))
+                {
+                    string testId;
+                    lock (_discoveryLock)
+                    {
+                        testId = _testDescriptions.TryGetValue(uid, out var description) ? description.Id : uid;
+                    }
+
+                    // Normal confidence is deliberate: the analyser then assesses static mutants
+                    // against every test (a warm host cannot observe which tests would rerun a
+                    // static initializer) while ordinary mutants get exactly their covering tests.
+                    results.Add(CoverageRunResult.Create(testId, CoverageConfidence.Normal, covered, statics, []));
+                }
+            }
+
+            _logger.LogInformation("Per-test coverage capture complete: {TestCount} tests, {CoveredCount} distinct mutations covered",
+                results.Count, results.SelectMany(r => r.MutationsCovered).Distinct().Count());
+
+            return results;
+        }
+        finally
+        {
+            foreach (var runner in _allRunners)
+            {
+                runner.SetCoverageMode(false);
+            }
+        }
+    }
+
+    private IEnumerable<ICoverageRunResult> CaptureAggregateCoverage(IProjectAndTests project)
     {
         _logger.LogInformation("Starting coverage capture for MTP runner");
 

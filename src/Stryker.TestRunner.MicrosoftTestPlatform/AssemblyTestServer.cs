@@ -131,7 +131,10 @@ internal sealed class AssemblyTestServer : IDisposable
         return results;
     }
 
-    public async Task<(List<TestNodeUpdate> Results, bool TimedOut)> RunTestsAsync(TestNode[]? testsToRun, TimeSpan? timeout)
+    public async Task<(List<TestNodeUpdate> Results, bool TimedOut)> RunTestsAsync(
+        TestNode[]? testsToRun,
+        TimeSpan? timeout,
+        Func<TestNodeUpdate, bool>? bailPredicate = null)
     {
         if (!_isInitialized || _client is null)
         {
@@ -141,12 +144,27 @@ internal sealed class AssemblyTestServer : IDisposable
         var runId = Guid.NewGuid();
         var testResults = new System.Collections.Concurrent.ConcurrentBag<TestNodeUpdate>();
 
+        // Bail: when a streamed update proves the mutant is already killed, cancel the run request.
+        // StreamJsonRpc turns the cancellation into a $/cancelRequest notification the test server
+        // honours; the collected results so far carry the killing test. Should the server ignore
+        // the cancellation, the RPC call simply completes normally and nothing is lost but time.
+        using var bailSource = new CancellationTokenSource();
+        var bailed = false;
+
         Func<TestNodeUpdate[], Task> onUpdate = updates =>
         {
             foreach (var update in updates)
             {
                 testResults.Add(update);
             }
+
+            if (bailPredicate is not null && !bailed && updates.Any(bailPredicate))
+            {
+                bailed = true;
+                _logger.LogDebug("{RunnerId}: Bailing out of test run for {Assembly}: a test already failed", _runnerId, _assembly);
+                bailSource.Cancel();
+            }
+
             return Task.CompletedTask;
         };
 
@@ -156,7 +174,7 @@ internal sealed class AssemblyTestServer : IDisposable
             try
             {
                 // The RPC call itself can block when the server is stuck (e.g. infinite loop in mutated code)
-                executeTestsResponse = await _client.RunTestsAsync(runId, onUpdate, testsToRun)
+                executeTestsResponse = await _client.RunTestsAsync(runId, onUpdate, testsToRun, bailSource.Token)
                     .WaitAsync(timeout.Value).ConfigureAwait(false);
             }
             catch (TimeoutException ex)
@@ -164,18 +182,41 @@ internal sealed class AssemblyTestServer : IDisposable
                 _logger.LogDebug(ex, "{RunnerId}: Test run RPC call timed out for {Assembly}", _runnerId, _assembly);
                 return (testResults.ToList(), true);
             }
+            catch (OperationCanceledException) when (bailed)
+            {
+                return (testResults.ToList(), false);
+            }
 
-            var completionTask = executeTestsResponse.WaitCompletionAsync(timeout.Value);
+            var completionTask = executeTestsResponse.WaitCompletionAsync(timeout.Value, bailSource.Token);
             await Task.WhenAny(completionTask, _process!.WaitForExitAsync()).ConfigureAwait(false);
+            if (bailed)
+            {
+                return (testResults.ToList(), false);
+            }
+
             ThrowIfHostCrashed(completionTask);
 
             var completed = await completionTask.ConfigureAwait(false);
             return (testResults.ToList(), !completed);
         }
 
-        var response = await _client.RunTestsAsync(runId, onUpdate, testsToRun).ConfigureAwait(false);
+        ResponseListener response;
+        try
+        {
+            response = await _client.RunTestsAsync(runId, onUpdate, testsToRun, bailSource.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (bailed)
+        {
+            return (testResults.ToList(), false);
+        }
+
         var responseCompletion = response.WaitCompletionAsync();
         await Task.WhenAny(responseCompletion, _process!.WaitForExitAsync()).ConfigureAwait(false);
+        if (bailed)
+        {
+            return (testResults.ToList(), false);
+        }
+
         ThrowIfHostCrashed(responseCompletion);
 
         await responseCompletion.ConfigureAwait(false);
