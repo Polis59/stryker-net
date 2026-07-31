@@ -319,10 +319,12 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             }
 
             // Wave slice sizes: most killed mutants die on their first assessing test, so early
-            // waves spend one execution per mutant; the tail widens geometrically and the final
-            // waves drain whatever is left. Extra draining waves cover mutants that had to defer
-            // tests because a batch-mate owned them in an earlier wave.
-            int[] waveSlices = [1, 2, 4, int.MaxValue, int.MaxValue, int.MaxValue];
+            // waves spend one execution per mutant and the next two widen geometrically. There
+            // is deliberately no draining wave: a mutant that passed seven of its tests is very
+            // probably a survivor, and a survivor's verdict is only accepted from the cold
+            // collectible confirmation anyway — draining its remaining set here would execute
+            // that set twice, once warm and once cold, for no additional information.
+            int[] waveSlices = [1, 2, 4];
 
             foreach (var sliceSize in waveSlices)
             {
