@@ -60,6 +60,39 @@ namespace Stryker
         public static int ActiveMutant = -2;
         public const int ActiveMutantNotInitValue = -2;
 
+        // --- Parallel multiplexed activation, self-contained ---
+        // During a parallel multiplexed session the runner publishes a test-to-mutant map
+        // under an "active-parallel" header and holds the control file at -1. Each test
+        // resolves its own assigned mutant by asking xUnit v3's ambient TestContext which
+        // test is executing (via cached reflection, once per test), then memoizes the
+        // binding in an AsyncLocal that flows with the test's execution context - so the
+        // per-mutation-point cost is a single AsyncLocal read. Work on threads that
+        // predate the test carries no context and no binding, and observes no mutant.
+        // No test-framework hook is required; the acknowledgement file is written here.
+        private static readonly object _parallelSync = new System.Object();
+        private static bool _parallelPathsProbed;
+        private static string _parallelMapFile = string.Empty;
+        private static string _parallelAckFile = string.Empty;
+        private static string _parallelErrorFile = string.Empty;
+        private static string _parallelHeader = string.Empty;
+        private static System.Collections.Generic.Dictionary<string, int> _parallelAssignments;
+        private static System.Threading.AsyncLocal<object[]> _parallelMemo;
+        private static bool _testContextProbed;
+        private static bool _testContextUnavailable;
+        // Negative-probe cache: when the map header is not active-parallel, IsActive must
+        // not pay a file open per mutation point. The runner always writes the map before
+        // starting a run request, and the RPC round trip alone exceeds this window, so a
+        // stale negative can never leak into a parallel session's test execution.
+        private static long _parallelNegativeUntilTicks;
+        private static System.Reflection.PropertyInfo _testContextCurrent;
+        private static System.Reflection.PropertyInfo _testContextTestCase;
+        private static System.Reflection.PropertyInfo _testCaseUniqueId;
+        private static System.Reflection.PropertyInfo _testContextTest;
+        private static System.Reflection.PropertyInfo _testDisplayName;
+
+        private const string ParallelHeaderPrefix = "stryker-mtp-activation-map-v1\tactive-parallel\t";
+        private const int ParallelUnbound = -2147483647;
+
         static MutantControl()
         {
             // Check for MTP file-based coverage mode at class initialization
@@ -272,6 +305,302 @@ namespace Stryker
 
         /// <summary>
         /// <summary>
+        /// Resolves the mutant bound to the currently executing test during a parallel
+        /// multiplexed session. Returns false when no parallel session is active (callers
+        /// fall through to the control-file path). When a parallel session is active the
+        /// out value is the bound mutant id, or <see cref="ParallelUnbound"/> for execution
+        /// that carries no test binding (background threads, unmapped runtime rows after
+        /// the error file is recorded) - such execution must observe no mutant.
+        /// </summary>
+        private static bool TryGetParallelMutant(out int mutantId)
+        {
+            mutantId = ParallelUnbound;
+
+            if (!_parallelPathsProbed)
+            {
+                lock (_parallelSync)
+                {
+                    if (!_parallelPathsProbed)
+                    {
+                        _parallelMapFile = System.Environment.GetEnvironmentVariable("STRYKER_MUTANT_MAP_FILE") ?? string.Empty;
+                        _parallelAckFile = System.Environment.GetEnvironmentVariable("STRYKER_MUTANT_MAP_ACK_FILE") ?? string.Empty;
+                        _parallelErrorFile = System.Environment.GetEnvironmentVariable("STRYKER_MUTANT_MAP_ERROR_FILE") ?? string.Empty;
+                        _parallelMemo = new System.Threading.AsyncLocal<object[]>();
+                        _parallelPathsProbed = true;
+                    }
+                }
+            }
+
+            if (_parallelMapFile.Length == 0)
+            {
+                return false;
+            }
+
+            // Fast path: a binding memoized earlier in this execution context. The memo was
+            // created inside the current test's async flow, so it cannot leak across tests.
+            object[] memo = _parallelMemo.Value;
+            if (memo != null)
+            {
+                string memoHeader = (string)memo[0];
+                if (string.Equals(memoHeader, _parallelHeader, System.StringComparison.Ordinal))
+                {
+                    mutantId = (int)memo[1];
+                    return true;
+                }
+            }
+
+            if (System.Environment.TickCount64 < System.Threading.Interlocked.Read(ref _parallelNegativeUntilTicks))
+            {
+                return false;
+            }
+
+            return ResolveParallelBinding(out mutantId);
+        }
+
+        private static bool ResolveParallelBinding(out int mutantId)
+        {
+            mutantId = ParallelUnbound;
+
+            string header;
+            try
+            {
+                using (System.IO.StreamReader reader = System.IO.File.OpenText(_parallelMapFile))
+                {
+                    header = reader.ReadLine() ?? string.Empty;
+                    if (!header.StartsWith(ParallelHeaderPrefix, System.StringComparison.Ordinal))
+                    {
+                        System.Threading.Interlocked.Exchange(
+                            ref _parallelNegativeUntilTicks,
+                            System.Environment.TickCount64 + 20);
+                        return false;
+                    }
+
+                    lock (_parallelSync)
+                    {
+                        if (!string.Equals(_parallelHeader, header, System.StringComparison.Ordinal) ||
+                            _parallelAssignments == null)
+                        {
+                            System.Collections.Generic.Dictionary<string, int> assignments =
+                                new System.Collections.Generic.Dictionary<string, int>(System.StringComparer.Ordinal);
+                            string line;
+                            while ((line = reader.ReadLine()) != null)
+                            {
+                                int separator = line.IndexOf('\t');
+                                if (separator <= 0)
+                                {
+                                    continue;
+                                }
+                                int assignedMutant;
+                                if (int.TryParse(line.Substring(0, separator), out assignedMutant))
+                                {
+                                    assignments[line.Substring(separator + 1)] = assignedMutant;
+                                }
+                            }
+
+                            _parallelAssignments = assignments;
+                            _parallelHeader = header;
+                        }
+                    }
+                }
+            }
+            catch (System.Exception)
+            {
+                // The runner rewrites the map between requests; a transient read failure is
+                // retried after the negative-probe window rather than on every mutation point.
+                System.Threading.Interlocked.Exchange(
+                    ref _parallelNegativeUntilTicks,
+                    System.Environment.TickCount64 + 20);
+                return false;
+            }
+
+            string testCaseUid;
+            string displayName;
+            if (!TryReadCurrentTest(out testCaseUid, out displayName))
+            {
+                if (_testContextUnavailable)
+                {
+                    RecordParallelError("The xUnit v3 TestContext is unavailable; parallel multiplexed activation cannot bind tests.");
+                    // Bound-but-unresolvable: the error file invalidates the session; local
+                    // execution observes no mutant.
+                    _parallelMemo.Value = new object[] { _parallelHeader, ParallelUnbound };
+                    return true;
+                }
+
+                // Execution outside any test (background threads): no binding, no mutant.
+                _parallelMemo.Value = new object[] { _parallelHeader, ParallelUnbound };
+                return true;
+            }
+
+            System.Collections.Generic.Dictionary<string, int> current = _parallelAssignments;
+            int resolved;
+            if (!current.TryGetValue(testCaseUid, out resolved))
+            {
+                string methodKey = MethodAssignmentKey(displayName);
+                if (methodKey == null || !current.TryGetValue(methodKey, out resolved))
+                {
+                    RecordParallelError("Test case '" + testCaseUid + "' has no mutant assignment in the active MTP request.");
+                    _parallelMemo.Value = new object[] { _parallelHeader, ParallelUnbound };
+                    return true;
+                }
+            }
+
+            AcknowledgeParallelMap(_parallelHeader);
+            _parallelMemo.Value = new object[] { _parallelHeader, resolved };
+            mutantId = resolved;
+            return true;
+        }
+
+        private static string MethodAssignmentKey(string displayName)
+        {
+            if (string.IsNullOrEmpty(displayName) ||
+                displayName.IndexOf('\r') >= 0 ||
+                displayName.IndexOf('\n') >= 0 ||
+                displayName.IndexOf('\t') >= 0)
+            {
+                return null;
+            }
+
+            int argumentsStart = displayName.IndexOf('(');
+            string methodDisplay = argumentsStart < 0 ? displayName : displayName.Substring(0, argumentsStart);
+            return methodDisplay.Length == 0 ? null : "method\t" + methodDisplay;
+        }
+
+        private static bool TryReadCurrentTest(out string testCaseUid, out string displayName)
+        {
+            testCaseUid = null;
+            displayName = null;
+
+            if (!_testContextProbed)
+            {
+                lock (_parallelSync)
+                {
+                    if (!_testContextProbed)
+                    {
+                        try
+                        {
+                            System.Type contextType = null;
+                            foreach (System.Reflection.Assembly assembly in System.AppDomain.CurrentDomain.GetAssemblies())
+                            {
+                                if (assembly.GetName().Name == "xunit.v3.core")
+                                {
+                                    contextType = assembly.GetType("Xunit.TestContext", false);
+                                    break;
+                                }
+                            }
+
+                            if (contextType != null)
+                            {
+                                _testContextCurrent = contextType.GetProperty("Current",
+                                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+                                _testContextTestCase = contextType.GetProperty("TestCase");
+                                _testContextTest = contextType.GetProperty("Test");
+                            }
+
+                            _testContextUnavailable = _testContextCurrent == null;
+                        }
+                        catch (System.Exception)
+                        {
+                            _testContextUnavailable = true;
+                        }
+
+                        _testContextProbed = true;
+                    }
+                }
+            }
+
+            if (_testContextUnavailable)
+            {
+                return false;
+            }
+
+            try
+            {
+                object context = _testContextCurrent.GetValue(null, null);
+                if (context == null)
+                {
+                    return false;
+                }
+
+                object testCase = _testContextTestCase != null ? _testContextTestCase.GetValue(context, null) : null;
+                if (testCase == null)
+                {
+                    return false;
+                }
+
+                if (_testCaseUniqueId == null)
+                {
+                    _testCaseUniqueId = testCase.GetType().GetProperty("UniqueID");
+                }
+                object uid = _testCaseUniqueId != null ? _testCaseUniqueId.GetValue(testCase, null) : null;
+                if (uid == null)
+                {
+                    return false;
+                }
+                testCaseUid = (string)uid;
+
+                object test = _testContextTest != null ? _testContextTest.GetValue(context, null) : null;
+                if (test != null)
+                {
+                    if (_testDisplayName == null)
+                    {
+                        _testDisplayName = test.GetType().GetProperty("TestDisplayName");
+                    }
+                    if (_testDisplayName != null)
+                    {
+                        displayName = _testDisplayName.GetValue(test, null) as string;
+                    }
+                }
+
+                return true;
+            }
+            catch (System.Exception)
+            {
+                return false;
+            }
+        }
+
+        private static void AcknowledgeParallelMap(string header)
+        {
+            if (_parallelAckFile.Length == 0)
+            {
+                return;
+            }
+
+            string acknowledgement = header.Substring(ParallelHeaderPrefix.Length);
+            try
+            {
+                if (!System.IO.File.Exists(_parallelAckFile) ||
+                    System.IO.File.ReadAllText(_parallelAckFile) != acknowledgement)
+                {
+                    System.IO.File.WriteAllText(_parallelAckFile, acknowledgement);
+                }
+            }
+            catch (System.Exception)
+            {
+                // A concurrent writer produced the same token; the runner only compares content.
+            }
+        }
+
+        private static void RecordParallelError(string message)
+        {
+            if (_parallelErrorFile.Length == 0)
+            {
+                return;
+            }
+
+            try
+            {
+                if (!System.IO.File.Exists(_parallelErrorFile))
+                {
+                    System.IO.File.WriteAllText(_parallelErrorFile, message);
+                }
+            }
+            catch (System.Exception)
+            {
+                // The session is already being invalidated by another writer.
+            }
+        }
+
         public static void SetActiveMutantViaEnvironmentVariable(int mutantId)
         {
             // Ensure we never assign null to a non-nullable string
@@ -467,6 +796,15 @@ namespace Stryker
             {
                 RegisterCoverage(id);
                 return false;
+            }
+
+            // Parallel multiplexed sessions take precedence: each test resolves its own
+            // assigned mutant through xUnit's ambient TestContext, memoized per execution
+            // flow. Unbound execution (background threads, unmapped rows) observes no mutant.
+            int parallelMutant;
+            if (TryGetParallelMutant(out parallelMutant))
+            {
+                return id == parallelMutant;
             }
 
             // File-based mutant control (used by the MTP runner's persistent test hosts):

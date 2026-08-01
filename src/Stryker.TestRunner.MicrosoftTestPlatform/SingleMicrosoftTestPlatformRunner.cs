@@ -23,10 +23,11 @@ namespace Stryker.TestRunner.MicrosoftTestPlatform;
 /// </summary>
 public class SingleMicrosoftTestPlatformRunner : IDisposable
 {
-    // The activation-map file exists for the test framework's coverage sink protocol; the
-    // mutation phase itself activates whole-session mutants through the control file alone,
-    // so the map always carries the inactive header.
     private const string InactiveMutantMapHeader = "stryker-mtp-activation-map-v1\toff";
+    // Parallel multiplexed sessions: the injected MutantControl resolves each test's assigned
+    // mutant through xUnit's ambient TestContext and acknowledges this map itself, so a
+    // multi-mutant request keeps the host's normal test parallelism.
+    private const string ActiveParallelMutantMapHeaderPrefix = "stryker-mtp-activation-map-v1\tactive-parallel\t";
 
     private readonly int _id;
     private readonly Dictionary<string, List<TestNode>> _testsByAssembly;
@@ -41,6 +42,8 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     private readonly string _coverageFilePath;
     private readonly string _coverageMapFilePath;
     private readonly IStrykerOptions? _options;
+
+    private string? _expectedMutantMapAcknowledgement;
 
     private readonly Dictionary<string, AssemblyTestServer> _assemblyServers = new();
     private readonly object _serverLock = new();
@@ -94,7 +97,146 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     {
         DeleteIfExists(_mutantMapAcknowledgementFilePath);
         DeleteIfExists(_mutantMapErrorFilePath);
+        _expectedMutantMapAcknowledgement = null;
         WriteTextAtomically(_mutantMapFilePath, InactiveMutantMapHeader + Environment.NewLine);
+    }
+
+    /// <summary>
+    /// Publishes the test-to-mutant assignments of a packed parallel session. A theory
+    /// with deferred data enumeration is one discovered test case, but an MTP host
+    /// expands it at run time into per-row cases whose identifiers discovery never
+    /// produced; each assignment therefore additionally publishes a method-display key
+    /// so the injected helper can resolve an unknown row to its theory's assigned
+    /// mutant. A method whose assignments span more than one mutant gets no key, so an
+    /// ambiguous row still fails closed.
+    /// </summary>
+    private Dictionary<string, int> WriteParallelMutantMap(IReadOnlyList<IMutant> mutants)
+    {
+        DeleteIfExists(_mutantMapAcknowledgementFilePath);
+        DeleteIfExists(_mutantMapErrorFilePath);
+
+        var assignments = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var mutant in mutants)
+        {
+            foreach (var testUid in mutant.AssessingTests.GetIdentifiers())
+            {
+                if (testUid.Contains('\t', StringComparison.Ordinal) ||
+                    testUid.Contains('\r', StringComparison.Ordinal) ||
+                    testUid.Contains('\n', StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        $"Test identifier '{testUid}' cannot be represented by the mutation activation protocol.");
+                }
+
+                if (assignments.TryGetValue(testUid, out var existingMutantId) &&
+                    existingMutantId != mutant.Id)
+                {
+                    throw new InvalidOperationException(
+                        $"Test '{testUid}' was mapped to more than one mutant in the same MTP request.");
+                }
+
+                assignments[testUid] = mutant.Id;
+            }
+        }
+
+        var methodAssignments = new Dictionary<string, int>(StringComparer.Ordinal);
+        var ambiguousMethods = new HashSet<string>(StringComparer.Ordinal);
+        lock (_discoveryLock)
+        {
+            foreach (var (testUid, mutantId) in assignments)
+            {
+                if (!_testDescriptions.TryGetValue(testUid, out var description))
+                {
+                    continue;
+                }
+
+                var methodKey = MethodAssignmentKey(description.Description.Name);
+                if (methodKey is null)
+                {
+                    continue;
+                }
+
+                if (methodAssignments.TryGetValue(methodKey, out var existingMutantId) &&
+                    existingMutantId != mutantId)
+                {
+                    ambiguousMethods.Add(methodKey);
+                    continue;
+                }
+
+                methodAssignments[methodKey] = mutantId;
+            }
+        }
+
+        foreach (var ambiguousMethod in ambiguousMethods)
+        {
+            methodAssignments.Remove(ambiguousMethod);
+        }
+
+        foreach (var (methodKey, mutantId) in methodAssignments)
+        {
+            assignments[methodKey] = mutantId;
+        }
+
+        var acknowledgement = Guid.NewGuid().ToString("N");
+        var lines = new List<string>(assignments.Count + 1)
+        {
+            ActiveParallelMutantMapHeaderPrefix + acknowledgement,
+        };
+        lines.AddRange(
+            assignments
+                .OrderBy(assignment => assignment.Key, StringComparer.Ordinal)
+                .Select(assignment => $"{assignment.Value}\t{assignment.Key}"));
+
+        WriteTextAtomically(
+            _mutantMapFilePath,
+            string.Join(Environment.NewLine, lines) + Environment.NewLine);
+        _expectedMutantMapAcknowledgement = acknowledgement;
+        return assignments;
+    }
+
+    /// <summary>
+    /// Derives the activation-map key that binds every run-time-expanded row of a
+    /// theory to its method: the display name with the argument list removed, behind a
+    /// marker that cannot collide with a test identifier (identifiers containing a tab
+    /// are refused by the activation protocol). Returns null for display names the
+    /// protocol cannot represent.
+    /// </summary>
+    internal static string? MethodAssignmentKey(string? displayName)
+    {
+        if (string.IsNullOrWhiteSpace(displayName) ||
+            displayName.Contains('\r', StringComparison.Ordinal) ||
+            displayName.Contains('\n', StringComparison.Ordinal) ||
+            displayName.Contains('\t', StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        var argumentsStart = displayName.IndexOf('(', StringComparison.Ordinal);
+        var methodDisplay = argumentsStart < 0 ? displayName : displayName[..argumentsStart];
+        return methodDisplay.Length == 0 ? null : $"method\t{methodDisplay}";
+    }
+
+    private string? ValidateMutantMapAcknowledgement()
+    {
+        if (_expectedMutantMapAcknowledgement is null)
+        {
+            return null;
+        }
+
+        var expected = _expectedMutantMapAcknowledgement;
+        _expectedMutantMapAcknowledgement = null;
+
+        if (File.Exists(_mutantMapErrorFilePath))
+        {
+            return File.ReadAllText(_mutantMapErrorFilePath).Trim();
+        }
+
+        var actual = File.Exists(_mutantMapAcknowledgementFilePath)
+            ? File.ReadAllText(_mutantMapAcknowledgementFilePath).Trim()
+            : string.Empty;
+        return string.Equals(actual, expected, StringComparison.Ordinal)
+            ? null
+            : "The injected mutation activation helper did not acknowledge the current MTP request.";
     }
 
     public Task<bool> DiscoverTestsAsync(string assembly)
@@ -119,6 +261,33 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         if (mutants.Count == 0)
         {
             throw new ArgumentException("At least one mutant is required.", nameof(mutants));
+        }
+
+        // A multi-mutant group of ordinary mutants multiplexes through one parallel
+        // request: the map binds each covering test to its mutant, the injected helper
+        // resolves the binding per test, and the whole disjoint union runs with the
+        // host's normal parallelism under an exact measured budget. A group that the
+        // budget cannot afford leaves its unresolved mutants pending; the executor
+        // retries them one at a time below, where the whole-session truth court's
+        // generous budget rules and only a mutant that exhausts even that earns Timeout.
+        if (mutants.Count > 1 && !mutants.Any(RequiresProcessIsolation))
+        {
+            var packedAssignments = WriteParallelMutantMap(mutants);
+            try
+            {
+                return await RunAllTestsAsync(
+                    assemblies,
+                    mutantId: -1,
+                    mutants,
+                    update,
+                    timeoutCalc,
+                    BuildTestUidFilter(mutants),
+                    packedAssignments: packedAssignments).ConfigureAwait(false);
+            }
+            finally
+            {
+                WriteInactiveMutantMap();
+            }
         }
 
         // One mutant, one session: each mutant is activated for a whole run through the
@@ -666,7 +835,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         IReadOnlyList<TestNode> tests,
         CoverageConfidence confidence)
     {
-        const string header = "threadway-stryker-coverage-v1";
+        const string header = "stryker-mtp-coverage-v1";
         if (!File.Exists(_coverageMapFilePath))
         {
             throw new InvalidDataException(
@@ -970,7 +1139,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         }
     }
 
-    internal TimeSpan? CalculateAssemblyTimeout(List<TestNode> discoveredTests, ITimeoutValueCalculator timeoutCalc, string assembly)
+    internal TimeSpan? CalculateAssemblyTimeout(List<TestNode> discoveredTests, ITimeoutValueCalculator timeoutCalc, string assembly, bool parallelSession = false)
     {
         var estimatedTimeMs = (int)discoveredTests
             .Where(t => _testDescriptions.TryGetValue(t.Uid, out _))
@@ -993,7 +1162,15 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         // budget generous enough that a Timeout verdict means the mutant genuinely hangs
         // or drags, not that the session outran an estimate.
         var floorMs = 15_000 + (100 * discoveredTests.Count);
-        if (timeoutMs < floorMs)
+        if (parallelSession)
+        {
+            // A packed parallel session's healthy ceiling is a few seconds regardless of
+            // set size, so its measured budget is exact rather than a minimum: a slow
+            // mutant cannot drag its whole batch, because the batch times out cheaply and
+            // its unresolved mutants retry individually under the generous default floor.
+            timeoutMs = 8_000 + (10 * discoveredTests.Count);
+        }
+        else if (timeoutMs < floorMs)
         {
             timeoutMs = floorMs;
         }
@@ -1126,15 +1303,46 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         ITimeoutValueCalculator? timeoutCalc = null,
         Func<TestNode, bool>? testUidFilter = null,
         bool useFreshProcess = false,
-        Func<TestNodeUpdate, bool>? bailPredicate = null)
+        Func<TestNodeUpdate, bool>? bailPredicate = null,
+        IReadOnlyDictionary<string, int>? packedAssignments = null)
     {
         try
         {
             // The mutant is active for the whole run through the control file - stock
             // Stryker's whole-session activation on a persistent host. Activation must
             // precede the run request so static initialization in a fresh process (and
-            // fixture construction anywhere) observes the mutation.
+            // fixture construction anywhere) observes the mutation. A packed parallel
+            // session instead holds the control file inactive and binds mutants per test
+            // through the published map.
             WriteMutantIdToFile(mutantId);
+
+            if (packedAssignments is { Count: > 0 } && mutants is { Count: > 0 } && bailPredicate is null)
+            {
+                // Bail with stock's exact semantics: cancel the request the moment every
+                // mutant of the session has a verdict. A killing test resolves its assigned
+                // mutant; when the set of unresolved mutants empties, the remaining mapped
+                // tests prove nothing. A session containing a true survivor never bails.
+                var unresolved = new HashSet<int>(mutants.Select(m => m.Id));
+                var bailLock = new object();
+                bailPredicate = update =>
+                {
+                    if (update.Node.ExecutionState is not (TestNodeStates.Failed or TestNodeStates.Error or TestNodeStates.TimedOut))
+                    {
+                        return false;
+                    }
+
+                    if (!packedAssignments.TryGetValue(update.Node.Uid, out var ownerId))
+                    {
+                        return false;
+                    }
+
+                    lock (bailLock)
+                    {
+                        unresolved.Remove(ownerId);
+                        return unresolved.Count == 0;
+                    }
+                };
+            }
 
             var accumulator = new TestRunAccumulator();
 
@@ -1151,7 +1359,8 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                             assembly,
                             timeoutCalc,
                             testUidFilter,
-                            bailPredicate).ConfigureAwait(false);
+                            bailPredicate,
+                            parallelSession: packedAssignments is not null).ConfigureAwait(false);
 
                 if (discoveredTests is not null)
                 {
@@ -1169,6 +1378,18 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                                         .Where(testUidFilter)
                                         .Select(test => test.Uid));
                         }
+                        else if (packedAssignments is not null)
+                        {
+                            // A timed-out packed session must not blanket-stamp its tests:
+                            // mutants killed by completed failures keep their kills, mutants
+                            // whose full set ran clean keep survival, and everyone with
+                            // incomplete evidence stays pending for an individual retry in
+                            // the whole-session truth court. Stamping every discovered test
+                            // as timed out would instead hand all unresolved mutants a
+                            // Timeout verdict the budget - not the mutant - earned. The
+                            // wedged host is still discarded.
+                            await DiscardServerAsync(assembly).ConfigureAwait(false);
+                        }
                         else
                         {
                             await HandleAssemblyTimeoutAsync(
@@ -1182,6 +1403,35 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 if (result is not null)
                 {
                     accumulator.Aggregate(result, discoveredTests);
+                }
+            }
+
+            if (packedAssignments is not null)
+            {
+                // The injected helper acknowledges the map when its per-test binding armed.
+                // A missing or mismatched acknowledgement means tests ran without binding;
+                // the whole session fails closed rather than reporting unattributed verdicts.
+                var activationError = ValidateMutantMapAcknowledgement();
+                if (!string.IsNullOrWhiteSpace(activationError))
+                {
+                    _logger.LogError(
+                        "{RunnerId}: Mutation activation protocol failed: {ActivationError}",
+                        RunnerId,
+                        activationError);
+                    IEnumerable<MtpTestDescription> descriptions;
+                    lock (_discoveryLock)
+                    {
+                        descriptions = _testDescriptions.Values.ToList();
+                    }
+
+                    return TestRunResult.RuntimeError(
+                        descriptions,
+                        accumulator.BuildExecutedTests(),
+                        TestIdentifierList.NoTest(),
+                        TestIdentifierList.NoTest(),
+                        activationError,
+                        accumulator.Messages,
+                        accumulator.TotalDuration);
                 }
             }
 
@@ -1267,7 +1517,8 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         string assembly,
         ITimeoutValueCalculator? timeoutCalc,
         Func<TestNode, bool>? testUidFilter = null,
-        Func<TestNodeUpdate, bool>? bailPredicate = null)
+        Func<TestNodeUpdate, bool>? bailPredicate = null,
+        bool parallelSession = false)
     {
         if (!File.Exists(assembly))
         {
@@ -1283,10 +1534,10 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             var testsToRun = testUidFilter is null
                 ? discoveredTests
                 : discoveredTests.Where(testUidFilter).ToList();
-            timeout = CalculateAssemblyTimeout(testsToRun, timeoutCalc, assembly);
+            timeout = CalculateAssemblyTimeout(testsToRun, timeoutCalc, assembly, parallelSession);
         }
 
-        var (testResults, timedOut) = await RunAssemblyTestsInternalAsync(assembly, testUidFilter, timeout, bailPredicate).ConfigureAwait(false);
+        var (testResults, timedOut) = await RunAssemblyTestsInternalAsync(assembly, testUidFilter, timeout, bailPredicate, stallDetection: parallelSession).ConfigureAwait(false);
 
         return (testResults as TestRunResult, timedOut, discoveredTests);
     }
@@ -1295,7 +1546,8 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         string assembly,
         Func<TestNode, bool>? testUidFilter,
         TimeSpan? timeout = null,
-        Func<TestNodeUpdate, bool>? bailPredicate = null)
+        Func<TestNodeUpdate, bool>? bailPredicate = null,
+        bool stallDetection = false)
     {
         // A crashed test host tears down the RPC connection, so the run throws (rather than timing out).
         // Retry once on a freshly started server: a crash caused by a *previous* mutant then self-heals
@@ -1344,7 +1596,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                     return (BuildTestRunResult([], tests?.Count ?? 0, TimeSpan.Zero), false);
                 }
 
-                var (testResults, timedOut) = await server.RunTestsAsync(testsToRun, timeout, bailPredicate, stallDetection: false).ConfigureAwait(false);
+                var (testResults, timedOut) = await server.RunTestsAsync(testsToRun, timeout, bailPredicate, stallDetection).ConfigureAwait(false);
 
                 var duration = DateTime.UtcNow - startTime;
                 var result = BuildTestRunResult(

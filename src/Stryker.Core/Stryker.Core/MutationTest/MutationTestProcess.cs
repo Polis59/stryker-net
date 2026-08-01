@@ -169,73 +169,12 @@ public class MutationTestProcess : IMutationTestProcess
         return true;
     }
 
-    private IEnumerable<List<IMutant>> BuildMutantGroupsForTest(IReadOnlyCollection<IMutant> mutantsNotRun)
-    {
-        if (_options.OptimizationMode.HasFlag(OptimizationModes.DisableMixMutants) ||
-            !_options.OptimizationMode.HasFlag(OptimizationModes.CoverageBasedTest))
-        {
-            return mutantsNotRun.Select(x => new List<IMutant> { x });
-        }
-
-        var blocks = new List<List<IMutant>>(mutantsNotRun.Count);
-        var mutantsToGroup = mutantsNotRun.ToList();
-        // we deal with mutants needing full testing first
-        blocks.AddRange(mutantsToGroup.Where(m => m.AssessingTests.IsEveryTest)
-            .Select(m => new List<IMutant> { m }));
-        mutantsToGroup.RemoveAll(m => m.AssessingTests.IsEveryTest);
-
-        mutantsToGroup = mutantsToGroup.Where(m => m.ResultStatus == MutantStatus.Pending).ToList();
-
-        var testsCount = Input.InitialTestRun.Result.ExecutedTests.Count;
-        mutantsToGroup = mutantsToGroup.OrderBy(m => m.AssessingTests.Count).ToList();
-        while (mutantsToGroup.Count > 0)
-        {
-            // we pick the first mutant
-            var usedTests = mutantsToGroup[0].AssessingTests;
-            var nextBlock = new List<IMutant> { mutantsToGroup[0] };
-            mutantsToGroup.RemoveAt(0);
-            for (var j = 0; j < mutantsToGroup.Count; j++)
-            {
-                var currentMutant = mutantsToGroup[j];
-                var nextSet = currentMutant.AssessingTests;
-                if (nextSet.Count + usedTests.Count > testsCount)
-                {
-                    break;
-                }
-
-                if (nextSet.ContainsAny(usedTests))
-                {
-                    continue;
-                }
-
-                // add this mutant to the block
-                nextBlock.Add(currentMutant);
-                // remove the mutant from the list of mutants to group
-                mutantsToGroup.RemoveAt(j--);
-                // add this mutant's tests
-                usedTests = usedTests.Merge(nextSet);
-            }
-
-            blocks.Add(nextBlock);
-        }
-
-        if (mutantsNotRun.Count > blocks.Count)
-        {
-            _logger.LogDebug(
-                "Mutations will be tested in {BlocksCount} test runs, instead of {MutantsNotRun}.",
-                blocks.Count,
-                mutantsNotRun.Count);
-        }
-        else
-        {
-            _logger.LogDebug(
-                "Mutations will be tested in {BlocksCount} test runs.",
-                blocks.Count);
-        }
-
-
-        return blocks;
-    }
+    // The stock packer lets a static or early-activation mutant consume test slots in an
+    // otherwise reusable ordinary batch, after which the MTP runner must split the request
+    // again for correctness. The isolation-aware planner separates process-isolated mutants
+    // before packing ordinary mutants with disjoint assessing tests.
+    private IEnumerable<List<IMutant>> BuildMutantGroupsForTest(IReadOnlyCollection<IMutant> mutantsNotRun) =>
+        TestRunner.MicrosoftTestPlatform.MutationBatchPlanner.Build(_options, mutantsNotRun);
 
     public void GetCoverage() => _coverageAnalyser.DetermineTestCoverage(_options, Input.SourceProjectInfo,
         _mutationTestExecutor.TestRunner, _projectContents.Mutants, Input.InitialTestRun.Result.FailingTests);
