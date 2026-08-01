@@ -156,12 +156,20 @@ internal sealed class AssemblyTestServer : IDisposable
             try
             {
                 // The RPC call itself can block when the server is stuck (e.g. infinite loop in mutated code)
-                executeTestsResponse = await _client.RunTestsAsync(runId, onUpdate, testsToRun)
+                executeTestsResponse = await _client.RunTestsAsync(runId, onUpdate, testsToRun, timeout.Value)
                     .WaitAsync(timeout.Value).ConfigureAwait(false);
             }
             catch (TimeoutException ex)
             {
                 _logger.LogDebug(ex, "{RunnerId}: Test run RPC call timed out for {Assembly}", _runnerId, _assembly);
+                return (testResults.ToList(), true);
+            }
+            catch (OperationCanceledException ex)
+            {
+                // The client's backstop cancellation window expired. That is a timeout verdict,
+                // not a crash: reporting it as an exception would route the batch through the
+                // crash-retry path and burn the whole budget a second time.
+                _logger.LogDebug(ex, "{RunnerId}: Test run RPC call was cancelled by its backstop window for {Assembly}", _runnerId, _assembly);
                 return (testResults.ToList(), true);
             }
 
@@ -276,5 +284,3 @@ internal sealed class AssemblyTestServer : IDisposable
         StopAsync().GetAwaiter().GetResult();
     }
 }
-
-

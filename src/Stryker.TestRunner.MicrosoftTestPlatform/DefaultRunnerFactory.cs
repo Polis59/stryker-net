@@ -19,7 +19,6 @@ public interface ISingleRunnerFactory
         ILogger logger,
         IStrykerOptions? options = null);
 }
-
 /// <summary>
 /// The default implementation of ISingleRunnerFactory that creates SingleMicrosoftTestPlatformRunner instances.
 /// </summary>
@@ -35,4 +34,3 @@ public class DefaultRunnerFactory : ISingleRunnerFactory
         IStrykerOptions? options = null) =>
         new(id, testsByAssembly, testDescriptions, testSet, discoveryLock, logger, options);
 }
-

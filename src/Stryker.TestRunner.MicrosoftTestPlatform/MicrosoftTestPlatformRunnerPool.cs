@@ -17,9 +17,14 @@ namespace Stryker.TestRunner.MicrosoftTestPlatform;
 /// </summary>
 public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
 {
-    private readonly AutoResetEvent _runnerAvailableHandler = new(false);
+    // Counts available runners so checkout can await without a polling interval. The
+    // semaphore is released once per runner during initialization and once per return;
+    // a released count therefore always matches a runner sitting in _availableRunners.
+    private readonly SemaphoreSlim _runnerAvailable = new(0);
     private readonly ConcurrentBag<SingleMicrosoftTestPlatformRunner> _availableRunners = new();
-    private static readonly List<SingleMicrosoftTestPlatformRunner> _allRunners = new();
+    // Instance-scoped: there is one pool per run, and a static list would leak disposed runners
+    // across pool instances (notably between unit tests, and across solution-project pools).
+    private readonly ConcurrentBag<SingleMicrosoftTestPlatformRunner> _allRunners = new();
     private bool _disposed;
     private readonly ILogger _logger;
     private readonly int _countOfRunners;
@@ -27,6 +32,10 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
     private readonly Dictionary<string, List<TestNode>> _testsByAssembly = new();
     private readonly Dictionary<string, MtpTestDescription> _testDescriptions = new();
     private readonly object _discoveryLock = new();
+    private readonly object _coverageCacheLock = new();
+    private readonly Dictionary<
+        CoverageConfidence,
+        IReadOnlyList<ICoverageRunResult>> _perTestCoverageCache = [];
     private readonly ISingleRunnerFactory _runnerFactory;
     private readonly IStrykerOptions _options;
 
@@ -66,7 +75,7 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
                 _options);
             _availableRunners.Add(runner);
             _allRunners.Add(runner);
-            _runnerAvailableHandler.Set();
+            _runnerAvailable.Release();
         });
     }
 
@@ -100,7 +109,20 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
 
     public IEnumerable<ICoverageRunResult> CaptureCoverage(IProjectAndTests project)
     {
-        _logger.LogInformation("Starting coverage capture for MTP runner");
+        if (_options.OptimizationMode.HasFlag(OptimizationModes.CoverageBasedTest))
+        {
+            var confidence = _options.OptimizationMode.HasFlag(OptimizationModes.CaptureCoveragePerTest)
+                ? CoverageConfidence.Exact
+                : CoverageConfidence.Normal;
+            return CaptureCoverageTestByTest(project, confidence);
+        }
+
+        return CaptureCoverageInOneGo(project);
+    }
+
+    private IEnumerable<ICoverageRunResult> CaptureCoverageInOneGo(IProjectAndTests project)
+    {
+        _logger.LogInformation("Starting aggregate coverage capture for MTP runner");
 
         // Enable coverage mode on all runners
         foreach (var runner in _allRunners)
@@ -110,7 +132,6 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
 
         try
         {
-            // Run all tests with coverage tracking enabled
             var testResult = RunThisAsync(runner => runner.InitialTestAsync(project)).GetAwaiter().GetResult();
 
             if (testResult.FailingTests.IsEveryTest)
@@ -118,10 +139,8 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
                 _logger.LogWarning("Coverage test run failed: {Message}", testResult.ResultMessage);
             }
 
-            // Reset test processes to trigger coverage file flush (process exit writes coverage)
             ResetTestProcesses();
 
-            // Aggregate coverage data from all runners
             var allCoveredMutants = new HashSet<int>();
             var allStaticMutants = new HashSet<int>();
 
@@ -138,12 +157,9 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
                 }
             }
 
-            _logger.LogInformation("Coverage capture complete: {CoveredCount} mutations covered, {StaticCount} static mutations",
+            _logger.LogInformation("Aggregate coverage capture complete: {CoveredCount} mutations covered, {StaticCount} static mutations",
                 allCoveredMutants.Count, allStaticMutants.Count);
 
-            // For cumulative coverage, we return a single coverage result that applies to all tests
-            // Each test is assumed to cover all the mutations that were covered during the full test run
-            // Static mutants are marked as such for proper handling during mutation testing
             return _testDescriptions.Values.Select(testDescription =>
                 CoverageRunResult.Create(
                     testDescription.Id,
@@ -154,12 +170,126 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
         }
         finally
         {
-            // Disable coverage mode on all runners for subsequent mutation testing
             foreach (var runner in _availableRunners)
             {
                 runner.SetCoverageMode(false);
             }
         }
+    }
+
+    private IEnumerable<ICoverageRunResult> CaptureCoverageTestByTest(
+        IProjectAndTests project, CoverageConfidence confidence)
+    {
+        lock (_coverageCacheLock)
+        {
+            if (_perTestCoverageCache.TryGetValue(confidence, out var cached))
+            {
+                _logger.LogInformation(
+                    "Reusing {TestCount} exact per-test coverage mappings from the campaign snapshot",
+                    cached.Count);
+                return cached;
+            }
+        }
+
+        _logger.LogInformation("Starting exact per-test coverage capture for MTP runner");
+
+        foreach (var runner in _availableRunners)
+        {
+            runner.SetCoverageMode(true);
+        }
+
+        try
+        {
+            var allTests = new List<(string Assembly, TestNode Test)>();
+            foreach (var (assembly, tests) in _testsByAssembly)
+            {
+                foreach (var test in tests)
+                {
+                    if (_testDescriptions.ContainsKey(test.Uid))
+                    {
+                        allTests.Add((assembly, test));
+                    }
+                }
+            }
+
+            var coverageGroups = allTests
+                .GroupBy(test => (test.Assembly, Boundary: GetCoverageBoundary(test.Test)))
+                .Select(group => (
+                    group.Key.Assembly,
+                    group.Key.Boundary,
+                    Tests: (IReadOnlyList<TestNode>)group.Select(test => test.Test).ToList()))
+                .ToList();
+
+            _logger.LogInformation(
+                "Capturing per-test coverage for {TestCount} tests in {GroupCount} collectible class boundaries across {AssemblyCount} assemblies",
+                allTests.Count,
+                coverageGroups.Count,
+                _testsByAssembly.Count);
+
+            var results = new ConcurrentBag<ICoverageRunResult>();
+
+            Parallel.ForEach(coverageGroups,
+                new ParallelOptions { MaxDegreeOfParallelism = _countOfRunners },
+                coverageGroup =>
+                {
+                    var groupResults = RunThisAsync(async runner =>
+                        await runner.RunTestGroupForCoverageAsync(
+                            coverageGroup.Assembly,
+                            coverageGroup.Tests,
+                            confidence)
+                            .ConfigureAwait(false))
+                        .GetAwaiter().GetResult();
+
+                    foreach (var result in groupResults)
+                    {
+                        results.Add(result);
+                    }
+                });
+
+            var captured = results.ToList();
+            _logger.LogInformation(
+                "Per-test coverage capture complete: {TestCount} exact mappings captured from {GroupCount} collectible contexts",
+                captured.Count,
+                coverageGroups.Count);
+
+            // Stryker 4.16 injects every solution-project assembly before it
+            // sequentially asks this one runner pool to assign coverage for
+            // each project. The capture therefore contains the complete mutant
+            // universe; recomputing it per project repeats identical test work.
+            lock (_coverageCacheLock)
+            {
+                _perTestCoverageCache[confidence] = captured;
+            }
+
+            return captured;
+        }
+        finally
+        {
+            foreach (var runner in _availableRunners)
+            {
+                runner.SetCoverageMode(false);
+            }
+        }
+    }
+
+    internal static string GetCoverageBoundary(TestNode test)
+    {
+        var displayName = test.DisplayName;
+        var argumentsStart = displayName.IndexOf('(');
+        var methodEnd = argumentsStart >= 0 ? argumentsStart : displayName.Length;
+        if (methodEnd == 0)
+        {
+            return test.Uid;
+        }
+
+        var classSeparator = displayName.LastIndexOf('.', methodEnd - 1);
+
+        // Standard xUnit display names are namespace-qualified class and method
+        // names. A custom display name has no reliable class boundary, so it
+        // remains a singleton rather than being grouped unsafely.
+        return classSeparator > 0
+            ? displayName[..classSeparator]
+            : test.Uid;
     }
 
     public async Task<ITestRunResult> TestMultipleMutantsAsync(
@@ -179,30 +309,19 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
 
     private async Task<T> RunThisAsync<T>(Func<SingleMicrosoftTestPlatformRunner, Task<T>> task)
     {
-        SingleMicrosoftTestPlatformRunner? runner;
-
-        // Try to get a runner with a timeout to prevent indefinite blocking
-        var attempts = 0;
-        const int maxWaitTimeSeconds = 300; // 5 minutes max wait
-        const int waitIntervalMs = 1000; // Check every second
-        var maxAttempts = maxWaitTimeSeconds * 1000 / waitIntervalMs;
-
-        while (!_availableRunners.TryTake(out runner))
+        // The semaphore's count mirrors _availableRunners, so a successful wait
+        // guarantees the bag holds a runner. Awaiting (instead of the previous
+        // one-second AutoResetEvent poll, which also blocked a thread-pool thread)
+        // hands a returned runner to the next waiter immediately.
+        if (!await _runnerAvailable.WaitAsync(TimeSpan.FromMinutes(5)).ConfigureAwait(false))
         {
-            if (!_runnerAvailableHandler.WaitOne(waitIntervalMs))
-            {
-                attempts++;
-                if (attempts >= maxAttempts)
-                {
-                    throw new TimeoutException($"Timed out waiting for an available test runner after {maxWaitTimeSeconds} seconds. Available runners: {_availableRunners.Count}, Total runners: {_countOfRunners}");
-                }
+            throw new TimeoutException($"Timed out waiting for an available test runner after 300 seconds. Available runners: {_availableRunners.Count}, Total runners: {_countOfRunners}");
+        }
 
-                if (attempts % 30 == 0) // Log every 30 seconds
-                {
-                    _logger.LogWarning("Waiting for available test runner... ({Attempts}s elapsed, {Available}/{Total} runners available)",
-                        attempts, _availableRunners.Count, _countOfRunners);
-                }
-            }
+        if (!_availableRunners.TryTake(out var runner))
+        {
+            _runnerAvailable.Release();
+            throw new InvalidOperationException("The runner pool signalled availability but held no runner.");
         }
 
         try
@@ -212,7 +331,7 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
         finally
         {
             _availableRunners.Add(runner);
-            _runnerAvailableHandler.Set();
+            _runnerAvailable.Release();
         }
     }
 
@@ -229,7 +348,6 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
         {
             runner.Dispose();
         }
-        _runnerAvailableHandler.Dispose();
+        _runnerAvailable.Dispose();
     }
 }
-

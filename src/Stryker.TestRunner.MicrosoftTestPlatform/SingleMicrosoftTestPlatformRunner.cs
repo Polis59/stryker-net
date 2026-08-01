@@ -1,8 +1,5 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO.MemoryMappedFiles;
-using System.Security.Cryptography;
-using System.Text;
 using Microsoft.Extensions.Logging;
 using Stryker.Abstractions;
 using Stryker.Abstractions.Options;
@@ -19,9 +16,18 @@ namespace Stryker.TestRunner.MicrosoftTestPlatform;
 /// environment variables. Used by MicrosoftTestPlatformRunnerPool.
 /// Maintains persistent test server connections per assembly to reduce process startup overhead.
 /// Uses file-based mutant control to allow changing the active mutant without restarting processes.
+/// Disjoint ordinary mutants share a request through a test-case activation map consumed by the
+/// test framework's synchronous xUnit lifecycle sink.
+/// Mutants that need static-state isolation execute in fresh collectible load contexts inside a
+/// broker process, see <see cref="RequiresProcessIsolation"/>.
 /// </summary>
 public class SingleMicrosoftTestPlatformRunner : IDisposable
 {
+    // The activation-map file exists for the test framework's coverage sink protocol; the
+    // mutation phase itself activates whole-session mutants through the control file alone,
+    // so the map always carries the inactive header.
+    private const string InactiveMutantMapHeader = "stryker-mtp-activation-map-v1\toff";
+
     private readonly int _id;
     private readonly Dictionary<string, List<TestNode>> _testsByAssembly;
     private readonly Dictionary<string, MtpTestDescription> _testDescriptions;
@@ -29,13 +35,11 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     private readonly object _discoveryLock;
     private readonly ILogger _logger;
     private readonly string _mutantFilePath;
-    private readonly string _coverageFilePathBase;
-    // One coverage file per test assembly. The injected MutantControl flushes coverage with an
-    // unconditional overwrite on process exit, so with test hosts sharing a single file the last
-    // flush to land replaces all the others: only one assembly's coverage survives, and which one
-    // depends on server stop order and process shutdown timing. Giving every assembly's host its
-    // own file and unioning them at read time makes coverage independent of both.
-    private readonly ConcurrentDictionary<string, string> _coverageFilePaths = new();
+    private readonly string _mutantMapFilePath;
+    private readonly string _mutantMapAcknowledgementFilePath;
+    private readonly string _mutantMapErrorFilePath;
+    private readonly string _coverageFilePath;
+    private readonly string _coverageMapFilePath;
     private readonly IStrykerOptions? _options;
 
     private readonly Dictionary<string, AssemblyTestServer> _assemblyServers = new();
@@ -44,6 +48,12 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     private bool _coverageMode;
 
     private string RunnerId => $"MtpRunner-{_id}";
+    internal string MutantFilePath => _mutantFilePath;
+    internal string MutantMapFilePath => _mutantMapFilePath;
+    internal string MutantMapAcknowledgementFilePath => _mutantMapAcknowledgementFilePath;
+    internal string MutantMapErrorFilePath => _mutantMapErrorFilePath;
+    internal string CoverageFilePath => _coverageFilePath;
+    internal string CoverageMapFilePath => _coverageMapFilePath;
 
     public SingleMicrosoftTestPlatformRunner(
         int id,
@@ -62,19 +72,29 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         _logger = logger;
         _options = options;
 
-        // Create unique file paths for this runner to communicate with the test process.
-        // The coverage base name embeds the process id plus a per-instance nonce: coverage files
-        // are only deleted once their path has been assigned, so a predictable name could let a
-        // run read a stale file left behind by a crashed earlier run (same runner id, same
-        // assembly), and concurrent Stryker processes could clobber each other's files. The nonce
-        // covers what the process id alone does not (pid reuse, several runner instances with the
-        // same id in one process).
-        _mutantFilePath = Path.Combine(Path.GetTempPath(), $"stryker-mutant-{_id}.txt");
-        _coverageFilePathBase = Path.Combine(Path.GetTempPath(),
-            $"stryker-coverage-{Environment.ProcessId}-{_id}-{Guid.NewGuid().ToString("N")[..8]}");
+        // Stryker can create one runner pool per solution project. A pool-local
+        // numeric ID would let concurrent projects overwrite each other's
+        // activation and coverage channels.
+        var fileToken = $"{Environment.ProcessId}-{Guid.NewGuid():N}-{_id}";
+        _mutantFilePath = Path.Combine(Path.GetTempPath(), $"stryker-mutant-{fileToken}.txt");
+        _mutantMapFilePath = Path.Combine(Path.GetTempPath(), $"stryker-mutant-map-{fileToken}.txt");
+        _mutantMapAcknowledgementFilePath = Path.Combine(
+            Path.GetTempPath(),
+            $"stryker-mutant-map-ack-{fileToken}.txt");
+        _mutantMapErrorFilePath = Path.Combine(Path.GetTempPath(), $"stryker-mutant-map-error-{fileToken}.txt");
+        _coverageFilePath = Path.Combine(Path.GetTempPath(), $"stryker-coverage-{fileToken}.txt");
+        _coverageMapFilePath = Path.Combine(Path.GetTempPath(), $"stryker-coverage-map-{fileToken}.txt");
 
         // Initialize with no active mutation
         WriteMutantIdToFile(-1);
+        WriteInactiveMutantMap();
+    }
+
+    private void WriteInactiveMutantMap()
+    {
+        DeleteIfExists(_mutantMapAcknowledgementFilePath);
+        DeleteIfExists(_mutantMapErrorFilePath);
+        WriteTextAtomically(_mutantMapFilePath, InactiveMutantMapHeader + Environment.NewLine);
     }
 
     public Task<bool> DiscoverTestsAsync(string assembly)
@@ -88,7 +108,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         return RunAllTestsAsync(assemblies, mutantId: -1, mutants: null, update: null);
     }
 
-    public Task<ITestRunResult> TestMultipleMutantsAsync(
+    public async Task<ITestRunResult> TestMultipleMutantsAsync(
         IProjectAndTests project,
         ITimeoutValueCalculator? timeoutCalc,
         IReadOnlyList<IMutant> mutants,
@@ -96,20 +116,75 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     {
         var assemblies = project.GetTestAssemblies();
 
-        // Determine which mutant to activate
-        // When testing a single mutant, activate it; otherwise use -1 (no mutation)
-        var mutantId = mutants.Count == 1 ? mutants[0].Id : -1;
+        if (mutants.Count == 0)
+        {
+            throw new ArgumentException("At least one mutant is required.", nameof(mutants));
+        }
 
-        _logger.LogDebug("{RunnerId}: Testing mutant(s) [{Mutants}] with active mutation ID: {MutantId}",
-            RunnerId, string.Join(",", mutants.Select(m => m.Id)), mutantId);
+        // One mutant, one session: each mutant is activated for a whole run through the
+        // control file and its covering tests execute with the framework's normal
+        // parallelism - stock's exact semantics on a persistent host. A mutant whose
+        // activation must precede static initialization runs in a dedicated fresh process
+        // instead of the warm host. A caller-supplied group is simply processed in order;
+        // its verdicts are reported per mutant through the update handler.
+        ITestRunResult? lastResult = null;
+        foreach (var mutant in mutants)
+        {
+            var testUidFilter = BuildTestUidFilter([mutant]);
 
-        return RunAllTestsAsync(assemblies, mutantId, mutants, update, timeoutCalc);
+            if (_logger.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+            {
+                _logger.LogDebug(
+                    "{RunnerId}: Testing mutant {MutantId} ({Mode}) against {TestScope}",
+                    RunnerId,
+                    mutant.Id,
+                    RequiresProcessIsolation(mutant) ? "fresh process" : "warm host",
+                    testUidFilter is null ? "all tests" : "covering tests only");
+            }
+
+            lastResult = await RunAllTestsAsync(
+                assemblies,
+                mutant.Id,
+                [mutant],
+                update,
+                timeoutCalc,
+                testUidFilter,
+                useFreshProcess: RequiresProcessIsolation(mutant)).ConfigureAwait(false);
+        }
+
+        return lastResult!;
     }
 
-    public async Task ResetServerAsync()
+    private Func<TestNode, bool>? BuildTestUidFilter(IReadOnlyList<IMutant> mutants)
+    {
+        if (_options?.OptimizationMode.HasFlag(OptimizationModes.CoverageBasedTest) != true ||
+            mutants.Any(m => m.AssessingTests.IsEveryTest))
+        {
+            return null;
+        }
+
+        var testUids = mutants
+            .SelectMany(m => m.AssessingTests.GetIdentifiers())
+            .ToHashSet(StringComparer.Ordinal);
+
+        return testUids.Count == 0 ? _ => false : node => testUids.Contains(node.Uid);
+    }
+
+    /// <summary>
+    /// A mutation inside a static initializer (or one flagged by coverage analysis as needing early
+    /// activation) only takes effect while the type initializes, which happens once per assembly load
+    /// context. Testing it in a reused context is wrong in both directions: the mutation cannot
+    /// activate after its type initialized (false Survived), and mutated state would otherwise repeat
+    /// in later sessions and kill unrelated mutants (false Killed).
+    /// </summary>
+    private static bool RequiresProcessIsolation(IMutant mutant) =>
+        mutant.IsStaticValue || mutant.MustBeTestedInIsolation;
+
+
+    public virtual async Task ResetServerAsync()
     {
         _logger.LogDebug("{RunnerId}: Resetting test servers to reload assemblies", RunnerId);
-        
+
         lock (_serverLock)
         {
             foreach (var server in _assemblyServers.Values)
@@ -118,9 +193,307 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             }
             _assemblyServers.Clear();
         }
-        
+
         _logger.LogDebug("{RunnerId}: Test servers reset complete", RunnerId);
         await Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Stops and removes the server for a specific assembly. This triggers ProcessExit
+    /// in the test process, causing MutantControl.FlushCoverageToFile() to be called.
+    /// The server is removed from the cache so a fresh one is created on next use.
+    /// </summary>
+    internal async Task StopAndRemoveServerAsync(string assembly)
+    {
+        AssemblyTestServer? server;
+        lock (_serverLock)
+        {
+            _assemblyServers.TryGetValue(assembly, out server);
+            _assemblyServers.Remove(assembly);
+        }
+
+        if (server is not null)
+        {
+            await server.StopAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Runs one test class in an isolated collectible context. The xUnit lifecycle sink
+    /// records ordinary coverage for each test and widens static or outside-test
+    /// coverage across the class. The class boundary prevents initialization and
+    /// fixture work from leaking into another class without paying one process
+    /// startup per test.
+    /// The mutation phase absorbs a transient isolation-host loss as a per-mutant
+    /// runtime error, but during coverage capture a transient fault would abort
+    /// the whole campaign, so one boundary retries once. Two transient faults are
+    /// covered: the isolation host dying before it responds, and a published
+    /// coverage map that does not name every requested test (the lifecycle sink
+    /// records its own failures in the activation error file rather than failing
+    /// the test run). Every retry restarts from a clean control channel and an
+    /// empty coverage map, so a partial crashed attempt cannot contribute records.
+    /// </summary>
+    internal virtual async Task<IReadOnlyList<ICoverageRunResult>> RunTestGroupForCoverageAsync(
+        string assembly,
+        IReadOnlyList<TestNode> tests,
+        CoverageConfidence confidence)
+    {
+        const int maxCaptureAttempts = 2;
+        try
+        {
+            for (var attempt = 1; ; attempt++)
+            {
+                WriteMutantIdToFile(-1);
+                DeleteCoverageFile();
+                DeleteCoverageMapFile();
+
+                var execution = await ExecuteCoverageProcessAsync(assembly, tests).ConfigureAwait(false);
+                if (execution.TimedOut)
+                {
+                    throw new TimeoutException(
+                        "The coverage capture process exceeded its execution timeout.");
+                }
+
+                var hostLoss = string.IsNullOrWhiteSpace(execution.Error) ? null : execution.Error;
+                if (hostLoss is not null)
+                {
+                    if (attempt < maxCaptureAttempts)
+                    {
+                        _logger.LogWarning(
+                            "{RunnerId}: Coverage capture for boundary {Boundary} lost its isolation host " +
+                            "(attempt {Attempt}/{MaxAttempts}); retrying on a fresh host: {Error}",
+                            RunnerId,
+                            tests[0].DisplayName,
+                            attempt,
+                            maxCaptureAttempts,
+                            hostLoss);
+                        continue;
+                    }
+
+                    throw new InvalidOperationException(AppendSinkError(hostLoss));
+                }
+
+                IReadOnlyList<ICoverageRunResult> results;
+                try
+                {
+                    results = ReadPerTestCoverageData(tests, confidence);
+                }
+                catch (InvalidDataException incompleteCapture) when (attempt < maxCaptureAttempts)
+                {
+                    _logger.LogWarning(
+                        "{RunnerId}: Coverage capture for boundary {Boundary} published an incomplete " +
+                        "per-test map (attempt {Attempt}/{MaxAttempts}); retrying in a fresh context: " +
+                        "{Error} Sink error: {SinkError}",
+                        RunnerId,
+                        tests[0].DisplayName,
+                        attempt,
+                        maxCaptureAttempts,
+                        incompleteCapture.Message,
+                        ReadSinkError() ?? "<none>");
+                    continue;
+                }
+                catch (InvalidDataException incompleteCapture)
+                {
+                    throw new InvalidDataException(
+                        AppendSinkError(incompleteCapture.Message),
+                        incompleteCapture);
+                }
+
+                DeleteCoverageFile();
+                DeleteCoverageMapFile();
+
+                _logger.LogDebug(
+                    "{RunnerId}: Captured exact coverage for {TestCount} tests at boundary {Boundary}",
+                    RunnerId,
+                    results.Count,
+                    tests[0].DisplayName);
+
+                return results;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "{RunnerId}: Failed to capture coverage for test boundary {Boundary}",
+                RunnerId,
+                tests.Count == 0 ? "<empty>" : tests[0].DisplayName);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// The xUnit lifecycle sink deliberately keeps its own failures out of test
+    /// results and publishes them through the activation error file. A failed
+    /// capture must carry that diagnostic or the campaign reports only the
+    /// downstream symptom (missing per-test records).
+    /// </summary>
+    private string? ReadSinkError()
+    {
+        try
+        {
+            return File.Exists(_mutantMapErrorFilePath)
+                ? File.ReadAllText(_mutantMapErrorFilePath).Trim()
+                : null;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    private string AppendSinkError(string message)
+    {
+        var sinkError = ReadSinkError();
+        return sinkError is null
+            ? message
+            : $"{message} The coverage lifecycle sink reported: {sinkError}";
+    }
+
+    /// <summary>
+    /// Runs one coverage boundary's tests in a dedicated freshly spawned test-server
+    /// process, so the boundary's static initialization executes from scratch and its
+    /// coverage is attributed to this boundary alone. Virtual as a seam so tests can
+    /// exercise the capture retry without a real process.
+    /// </summary>
+    internal virtual async Task<(bool TimedOut, string? Error)> ExecuteCoverageProcessAsync(
+        string assembly,
+        IReadOnlyList<TestNode> tests)
+    {
+        // Generous fixed budget: the process pays spawn and session build, and the
+        // boundary's tests run serially under the coverage lifecycle sink.
+        var timeout = TimeSpan.FromMilliseconds(60_000 + (200 * tests.Count));
+
+        var server = new AssemblyTestServer(assembly, BuildEnvironmentVariables(), _logger, RunnerId, _options);
+        try
+        {
+            var started = await server.StartAsync().ConfigureAwait(false);
+            if (!started)
+            {
+                return (false, $"Failed to start the coverage capture process for {assembly}.");
+            }
+
+            var (_, timedOut) = await server.RunTestsAsync(tests.ToArray(), timeout).ConfigureAwait(false);
+            return (timedOut, null);
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+        finally
+        {
+            try
+            {
+                await server.StopAsync(force: true).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "{RunnerId}: Failed to stop the coverage capture process for {Assembly}", RunnerId, assembly);
+            }
+            server.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Maps run-time-expanded theory rows in MTP results back to their discovered
+    /// test case. An MTP host expands a deferred-enumeration theory into per-row
+    /// cases with identifiers discovery never produced; a mutant's assessing tests
+    /// and Stryker's verdict analysis both speak in discovered identifiers, so an
+    /// unmapped failing row would silently lose its kill. A row is mapped only to
+    /// an argument-free discovered case whose display name equals the row's
+    /// method display; anything unresolvable is preserved untouched.
+    /// </summary>
+    internal static IReadOnlyCollection<TestNodeUpdate> NormalizeToDiscoveredCases(
+        IReadOnlyCollection<TestNodeUpdate> updates,
+        IReadOnlyList<TestNode>? discoveredTests)
+    {
+        if (updates.Count == 0 || discoveredTests is null || discoveredTests.Count == 0)
+        {
+            return updates;
+        }
+
+        var discoveredUids = discoveredTests
+            .Select(test => test.Uid)
+            .ToHashSet(StringComparer.Ordinal);
+        if (updates.All(update => discoveredUids.Contains(update.Node.Uid)))
+        {
+            return updates;
+        }
+
+        var methodCases = new Dictionary<string, string>(StringComparer.Ordinal);
+        var ambiguousDisplays = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var test in discoveredTests)
+        {
+            // Only an unexpanded (argument-free) case can own run-time rows.
+            if (test.DisplayName.Contains('(', StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (!methodCases.TryAdd(test.DisplayName, test.Uid))
+            {
+                ambiguousDisplays.Add(test.DisplayName);
+            }
+        }
+
+        return updates
+            .Select(update =>
+            {
+                if (discoveredUids.Contains(update.Node.Uid))
+                {
+                    return update;
+                }
+
+                var display = update.Node.DisplayName;
+                var argumentsStart = display?.IndexOf('(', StringComparison.Ordinal) ?? -1;
+                if (argumentsStart <= 0)
+                {
+                    return update;
+                }
+
+                var methodDisplay = display![..argumentsStart];
+                return methodCases.TryGetValue(methodDisplay, out var parentUid) &&
+                    !ambiguousDisplays.Contains(methodDisplay)
+                        ? update with { Node = update.Node with { Uid = parentUid } }
+                        : update;
+            })
+            .ToList();
+    }
+
+    private static void WriteTextAtomically(string path, string content)
+    {
+        var temporaryPath = $"{path}.{Guid.NewGuid():N}.tmp";
+        try
+        {
+            File.WriteAllText(temporaryPath, content);
+
+            // The destination can be transiently locked by the test host's reader or an on-close
+            // antivirus scan; one refused move must not kill a campaign that is minutes from done.
+            const int maxMoveAttempts = 5;
+            for (var attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    File.Move(temporaryPath, path, overwrite: true);
+                    return;
+                }
+                catch (Exception ex) when (attempt < maxMoveAttempts && ex is IOException or UnauthorizedAccessException)
+                {
+                    Thread.Sleep(40 * attempt);
+                }
+            }
+        }
+        finally
+        {
+            DeleteIfExists(temporaryPath);
+        }
+    }
+
+    private static void DeleteIfExists(string path)
+    {
+        if (File.Exists(path))
+        {
+            File.Delete(path);
+        }
     }
 
     private void WriteMutantIdToFile(int mutantId)
@@ -151,11 +524,14 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         }
     }
 
-    private Dictionary<string, string?> BuildEnvironmentVariables(string assembly)
+    private Dictionary<string, string?> BuildEnvironmentVariables()
     {
         var envVars = new Dictionary<string, string?>
         {
-            ["STRYKER_MUTANT_FILE"] = _mutantFilePath
+            ["STRYKER_MUTANT_FILE"] = _mutantFilePath,
+            ["STRYKER_MUTANT_MAP_FILE"] = _mutantMapFilePath,
+            ["STRYKER_MUTANT_MAP_ACK_FILE"] = _mutantMapAcknowledgementFilePath,
+            ["STRYKER_MUTANT_MAP_ERROR_FILE"] = _mutantMapErrorFilePath,
         };
 
         ExternalEnvironmentVariables.Add(envVars);
@@ -163,29 +539,12 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         // Add coverage filename when in coverage mode (MutantControl will combine with temp path)
         if (_coverageMode)
         {
-            envVars["STRYKER_COVERAGE_FILE"] = Path.GetFileName(GetCoverageFilePath(assembly));
+            envVars["STRYKER_COVERAGE_FILE"] = Path.GetFileName(_coverageFilePath);
+            envVars["STRYKER_COVERAGE_MAP_FILE"] = _coverageMapFilePath;
         }
 
         return envVars;
     }
-
-    /// <summary>
-    /// Returns the coverage file path assigned to the given test assembly, assigning one on first
-    /// use. The base embeds the process id, runner id and a per-instance nonce (files from other
-    /// processes, runners and runner instances must not collide); the hash of the assembly path
-    /// distinguishes assemblies in different directories that share a file name. The assembly name
-    /// itself is only included, truncated, to keep the file recognizable when debugging.
-    /// </summary>
-    internal string GetCoverageFilePath(string assembly) =>
-        _coverageFilePaths.GetOrAdd(assembly, static (path, basePath) =>
-        {
-            var name = new string(Path.GetFileNameWithoutExtension(path)
-                .Select(c => char.IsLetterOrDigit(c) ? c : '-')
-                .Take(32)
-                .ToArray());
-            var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(path)))[..8];
-            return $"{basePath}-{name}-{hash}.txt";
-        }, _coverageFilePathBase);
 
     /// <summary>
     /// Enables or disables coverage capture mode. When enabled, the test process will track
@@ -212,51 +571,43 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             _assemblyServers.Clear();
         }
 
-        // Clean up any existing coverage files, even when enabling, to ensure we start fresh
-        DeleteCoverageFiles();
+        // Clean up any existing coverage file, even when enabling, to ensure we start fresh
+        DeleteCoverageFile();
     }
 
     /// <summary>
-    /// Reads coverage data from the per-assembly coverage files written by the test processes,
-    /// unioned across all assemblies this runner started a server for.
+    /// Reads coverage data from the coverage file written by the test process.
     /// Returns the covered mutants and static mutants as separate lists.
     /// </summary>
     public (IReadOnlyList<int> CoveredMutants, IReadOnlyList<int> StaticMutants) ReadCoverageData()
     {
-        var coveredMutants = new HashSet<int>();
-        var staticMutants = new HashSet<int>();
-
-        foreach (var (assembly, coverageFilePath) in _coverageFilePaths)
+        if (!File.Exists(_coverageFilePath))
         {
-            if (!File.Exists(coverageFilePath))
-            {
-                _logger.LogDebug("{RunnerId}: Coverage file for {Assembly} not found at {Path}",
-                    RunnerId, Path.GetFileName(assembly), coverageFilePath);
-                continue;
-            }
-
-            try
-            {
-                var content = File.ReadAllText(coverageFilePath).Trim();
-                _logger.LogDebug("{RunnerId}: Read coverage data for {Assembly}: {Content}",
-                    RunnerId, Path.GetFileName(assembly), content);
-
-                if (string.IsNullOrEmpty(content))
-                {
-                    continue;
-                }
-
-                var parts = content.Split(';');
-                coveredMutants.UnionWith(ParseMutantIds(parts.Length > 0 ? parts[0] : string.Empty));
-                staticMutants.UnionWith(ParseMutantIds(parts.Length > 1 ? parts[1] : string.Empty));
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "{RunnerId}: Failed to read coverage file at {Path}", RunnerId, coverageFilePath);
-            }
+            _logger.LogDebug("{RunnerId}: Coverage file not found at {Path}", RunnerId, _coverageFilePath);
+            return (Array.Empty<int>(), Array.Empty<int>());
         }
 
-        return (coveredMutants.ToList(), staticMutants.ToList());
+        try
+        {
+            var content = File.ReadAllText(_coverageFilePath).Trim();
+            _logger.LogDebug("{RunnerId}: Read coverage data: {Content}", RunnerId, content);
+
+            if (string.IsNullOrEmpty(content))
+            {
+                return (Array.Empty<int>(), Array.Empty<int>());
+            }
+
+            var parts = content.Split(';');
+            var coveredMutants = ParseMutantIds(parts.Length > 0 ? parts[0] : string.Empty);
+            var staticMutants = ParseMutantIds(parts.Length > 1 ? parts[1] : string.Empty);
+
+            return (coveredMutants, staticMutants);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "{RunnerId}: Failed to read coverage file at {Path}", RunnerId, _coverageFilePath);
+            return (Array.Empty<int>(), Array.Empty<int>());
+        }
     }
 
     private static IReadOnlyList<int> ParseMutantIds(string idString)
@@ -274,21 +625,242 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             .ToList();
     }
 
-    private void DeleteCoverageFiles()
+    private void DeleteCoverageFile()
     {
-        foreach (var coverageFilePath in _coverageFilePaths.Values)
+        try
+        {
+            if (File.Exists(_coverageFilePath))
+            {
+                File.Delete(_coverageFilePath);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "{RunnerId}: Failed to delete coverage file at {Path}", RunnerId, _coverageFilePath);
+        }
+    }
+
+    private void DeleteCoverageMapFile()
+    {
+        try
+        {
+            DeleteIfExists(_coverageMapFilePath);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "{RunnerId}: Failed to delete per-test coverage map at {Path}",
+                RunnerId,
+                _coverageMapFilePath);
+        }
+    }
+
+    internal IReadOnlyList<ICoverageRunResult> ReadPerTestCoverageData(
+        IReadOnlyList<TestNode> tests,
+        CoverageConfidence confidence)
+    {
+        const string header = "threadway-stryker-coverage-v1";
+        if (!File.Exists(_coverageMapFilePath))
+        {
+            throw new InvalidDataException(
+                "The xUnit coverage lifecycle sink did not publish per-test coverage.");
+        }
+
+        var lines = File.ReadAllLines(_coverageMapFilePath);
+        if (lines.Length == 0 ||
+            !string.Equals(lines[0], header, StringComparison.Ordinal))
+        {
+            throw new InvalidDataException("The per-test coverage map has an invalid header.");
+        }
+
+        var snapshots = new Dictionary<string, CoverageSnapshot>(StringComparer.Ordinal);
+        foreach (var line in lines.AsSpan(1))
+        {
+            var columns = line.Split('\t');
+            if (columns.Length != 4 || string.IsNullOrWhiteSpace(columns[0]))
+            {
+                throw new InvalidDataException(
+                    "The per-test coverage map contains an invalid record.");
+            }
+
+            var snapshot = new CoverageSnapshot(
+                ParseCoverageMutantIds(columns[1]),
+                ParseCoverageMutantIds(columns[2]),
+                ParseCoverageMutantIds(columns[3]));
+            if (snapshots.TryGetValue(columns[0], out var existing))
+            {
+                snapshots[columns[0]] = existing.Merge(snapshot);
+            }
+            else
+            {
+                snapshots.Add(columns[0], snapshot);
+            }
+        }
+
+
+        var expectedTestIds = tests.Select(test => test.Uid).ToHashSet(StringComparer.Ordinal);
+        var missingTestIds = expectedTestIds.Except(snapshots.Keys, StringComparer.Ordinal).ToList();
+        var unexpectedTestIds = snapshots.Keys.Except(expectedTestIds, StringComparer.Ordinal).ToList();
+        if (missingTestIds.Count > 0)
+        {
+            throw new InvalidDataException(
+                "The per-test coverage map did not match the requested MTP test cases. " +
+                $"Missing: [{string.Join(",", missingTestIds.Take(5))}].");
+        }
+
+        if (unexpectedTestIds.Count > 0)
+        {
+            _logger.LogDebug(
+                "{RunnerId}: Ignoring {UnexpectedTestCount} coverage records outside the requested MTP test cases",
+                RunnerId,
+                unexpectedTestIds.Count);
+        }
+
+        var requestedSnapshots = expectedTestIds
+            .ToDictionary(testId => testId, testId => snapshots[testId], StringComparer.Ordinal);
+        var classStaticMutants = requestedSnapshots.Values
+            .SelectMany(snapshot => snapshot.StaticMutants)
+            .ToHashSet();
+        var classOutsideTestMutants = requestedSnapshots.Values
+            .SelectMany(snapshot => snapshot.OutsideTestMutants)
+            .ToHashSet();
+
+        return tests
+            .Select(test =>
+            {
+                var snapshot = requestedSnapshots[test.Uid];
+                var coveredMutants = snapshot.CoveredMutants
+                    .Concat(classStaticMutants)
+                    .Concat(classOutsideTestMutants)
+                    .Distinct()
+                    .ToList();
+                return (ICoverageRunResult)CoverageRunResult.Create(
+                    test.Uid,
+                    confidence,
+                    coveredMutants,
+                    classStaticMutants,
+                    classOutsideTestMutants);
+            })
+            .ToList();
+    }
+
+    private static IReadOnlyList<int> ParseCoverageMutantIds(string value)
+    {
+        if (value.Length == 0)
+        {
+            return [];
+        }
+
+        var mutantIds = new List<int>();
+        foreach (var item in value.Split(','))
+        {
+            if (!int.TryParse(item, out var mutantId))
+            {
+                throw new InvalidDataException(
+                    "The per-test coverage map contains an invalid mutant identifier.");
+            }
+
+            mutantIds.Add(mutantId);
+        }
+
+        return mutantIds;
+    }
+
+    private sealed record CoverageSnapshot(
+        IReadOnlyList<int> CoveredMutants,
+        IReadOnlyList<int> StaticMutants,
+        IReadOnlyList<int> OutsideTestMutants)
+    {
+        internal CoverageSnapshot Merge(CoverageSnapshot other) =>
+            new(
+                CoveredMutants.Concat(other.CoveredMutants).Distinct().ToList(),
+                StaticMutants.Concat(other.StaticMutants).Distinct().ToList(),
+                OutsideTestMutants.Concat(other.OutsideTestMutants).Distinct().ToList());
+    }
+
+    /// <summary>
+    /// Tests one isolation-required mutant in a dedicated, freshly spawned test-server
+    /// process (the approach proposed in
+    /// https://github.com/stryker-mutator/stryker-net/pull/3695): the mutant id is
+    /// published to the control file before the process starts, so its statics
+    /// initialize under the active mutation, and the process is discarded afterwards.
+    /// Unlike a collectible load context, a fresh process keeps ReadyToRun native code
+    /// for the framework stack, and measured campaigns show statics that timed out in
+    /// collectible contexts complete with real verdicts here.
+    /// </summary>
+    private async Task<(TestRunResult? Result, bool TimedOut, List<TestNode>? DiscoveredTests)>
+        RunAssemblyTestsInFreshProcessAsync(
+            string assembly,
+            ITimeoutValueCalculator? timeoutCalc,
+            Func<TestNode, bool>? testUidFilter)
+    {
+        if (!File.Exists(assembly))
+        {
+            return (null, false, null);
+        }
+
+        var discoveredTests = GetDiscoveredTests(assembly);
+        if (discoveredTests is null)
+        {
+            return (
+                new TestRunResult(false, $"No discovered tests were available for '{assembly}'."),
+                false,
+                null);
+        }
+
+        var testsToRun = testUidFilter is null
+            ? discoveredTests
+            : discoveredTests.Where(testUidFilter).ToList();
+        if (testUidFilter is not null && testsToRun.Count == 0)
+        {
+            return (BuildTestRunResult([], discoveredTests.Count, TimeSpan.Zero), false, discoveredTests);
+        }
+
+        // Exact budget with a cold-start allowance: the dedicated process pays spawn and
+        // session build before its first result, and its tests run with xUnit's normal
+        // parallelism because the lone mutant is active for the whole process.
+        TimeSpan? timeout = timeoutCalc is null
+            ? null
+            : TimeSpan.FromMilliseconds(20_000 + (100 * testsToRun.Count));
+
+        var stopwatch = Stopwatch.StartNew();
+        var server = new AssemblyTestServer(assembly, BuildEnvironmentVariables(), _logger, RunnerId, _options);
+        try
+        {
+            var started = await server.StartAsync().ConfigureAwait(false);
+            if (!started)
+            {
+                return (
+                    new TestRunResult(false, $"Failed to start the dedicated test server for {assembly}."),
+                    false,
+                    discoveredTests);
+            }
+
+            var (testResults, timedOut) = await server
+                .RunTestsAsync(testsToRun.ToArray(), timeout)
+                .ConfigureAwait(false);
+            var result = BuildTestRunResult(
+                NormalizeToDiscoveredCases(testResults, discoveredTests),
+                discoveredTests.Count,
+                stopwatch.Elapsed);
+            return (result, timedOut, discoveredTests);
+        }
+        catch (Exception ex)
+        {
+            return (new TestRunResult(false, ex.Message), false, discoveredTests);
+        }
+        finally
         {
             try
             {
-                if (File.Exists(coverageFilePath))
-                {
-                    File.Delete(coverageFilePath);
-                }
+                await server.StopAsync(force: true).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "{RunnerId}: Failed to delete coverage file at {Path}", RunnerId, coverageFilePath);
+                _logger.LogDebug(ex, "{RunnerId}: Failed to stop the dedicated test server for {Assembly}", RunnerId, assembly);
             }
+            server.Dispose();
         }
     }
 
@@ -318,7 +890,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             await deadServer.StopAsync(force: true).ConfigureAwait(false);
         }
 
-        var environmentVariables = BuildEnvironmentVariables(assembly);
+        var environmentVariables = BuildEnvironmentVariables();
         var server = new AssemblyTestServer(assembly, environmentVariables, _logger, RunnerId, _options);
 
         var started = await server.StartAsync().ConfigureAwait(false);
@@ -404,11 +976,24 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                         : 0;
                 }
             });
-        
+
         var timeoutMs = timeoutCalc.CalculateTimeoutValue(estimatedTimeMs);
+
+        // The MTP protocol reports no per-test timing, so the estimate smears the initial
+        // run's duration evenly across the requested tests and can undershoot badly for a
+        // small set of genuinely slow tests. A tight budget would stamp slow-but-passing
+        // sessions as Timeout - verdicts that hide real survivors. The floor keeps the
+        // budget generous enough that a Timeout verdict means the mutant genuinely hangs
+        // or drags, not that the session outran an estimate.
+        var floorMs = 15_000 + (100 * discoveredTests.Count);
+        if (timeoutMs < floorMs)
+        {
+            timeoutMs = floorMs;
+        }
+
         _logger.LogDebug("{RunnerId}: Using {TimeoutMs} ms as test run timeout for {Assembly}",
             RunnerId, timeoutMs, Path.GetFileName(assembly));
-        
+
         return TimeSpan.FromMilliseconds(timeoutMs);
     }
 
@@ -417,27 +1002,34 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         _logger.LogDebug("{RunnerId}: Test run timed out for {Assembly}", RunnerId, Path.GetFileName(assembly));
 
         allTimedOutTests.AddRange(discoveredTests.Select(t => t.Uid));
-        
+
         AssemblyTestServer? server;
         lock (_serverLock)
         {
             _assemblyServers.TryGetValue(assembly, out server);
+            _assemblyServers.Remove(assembly);
         }
-        
+
         if (server is not null)
         {
-            _logger.LogDebug("{RunnerId}: Restarting test server for {Assembly} after timeout", RunnerId, Path.GetFileName(assembly));
+            _logger.LogDebug(
+                "{RunnerId}: Discarding test server for {Assembly} after timeout",
+                RunnerId,
+                Path.GetFileName(assembly));
             try
             {
-                await server.RestartAsync(force: true).ConfigureAwait(false);
+                // Do not eagerly start the replacement while the timed-out
+                // mutant is still active. The next mutation writes its own ID
+                // before lazily starting a clean application.
+                await server.StopAsync(force: true).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                _logger.LogDebug(ex, "{RunnerId}: Failed to restart test server for {Assembly} after timeout. Creating a new server on next use.", RunnerId, Path.GetFileName(assembly));
-                lock (_serverLock)
-                {
-                    _assemblyServers.Remove(assembly);
-                }
+                _logger.LogDebug(
+                    ex,
+                    "{RunnerId}: Failed to discard test server for {Assembly} after timeout",
+                    RunnerId,
+                    Path.GetFileName(assembly));
             }
         }
     }
@@ -477,6 +1069,13 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
 
             if (result.ExecutedTests.IsEveryTest)
             {
+                // "Every test" is relative to one assembly: expand it to the discovered uids so
+                // the aggregated identifier list stays complete when another assembly runs a
+                // filtered subset (or is skipped) and the aggregate cannot compress to EveryTest.
+                if (discoveredTests is not null)
+                {
+                    _executedTests.AddRange(discoveredTests.Select(t => t.Uid));
+                }
                 _totalExecutedTests += discoveredTests?.Count ?? 0;
             }
             else
@@ -517,17 +1116,32 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         int mutantId,
         IReadOnlyList<IMutant>? mutants,
         TestUpdateHandler? update,
-        ITimeoutValueCalculator? timeoutCalc = null)
+        ITimeoutValueCalculator? timeoutCalc = null,
+        Func<TestNode, bool>? testUidFilter = null,
+        bool useFreshProcess = false)
     {
         try
         {
+            // The mutant is active for the whole run through the control file - stock
+            // Stryker's whole-session activation on a persistent host. Activation must
+            // precede the run request so static initialization in a fresh process (and
+            // fixture construction anywhere) observes the mutation.
             WriteMutantIdToFile(mutantId);
 
             var accumulator = new TestRunAccumulator();
 
             foreach (var assembly in assemblies)
             {
-                var (result, timedOut, discoveredTests) = await RunAssemblyTestsAsync(assembly, timeoutCalc).ConfigureAwait(false);
+                var (result, timedOut, discoveredTests) =
+                    useFreshProcess
+                        ? await RunAssemblyTestsInFreshProcessAsync(
+                            assembly,
+                            timeoutCalc,
+                            testUidFilter).ConfigureAwait(false)
+                        : await RunAssemblyTestsAsync(
+                            assembly,
+                            timeoutCalc,
+                            testUidFilter).ConfigureAwait(false);
 
                 if (discoveredTests is not null)
                 {
@@ -536,7 +1150,22 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                     if (timedOut)
                     {
                         accumulator.HasTimeout = true;
-                        await HandleAssemblyTimeoutAsync(assembly, discoveredTests, accumulator.TimedOutTests).ConfigureAwait(false);
+                        if (useFreshProcess)
+                        {
+                            accumulator.TimedOutTests.AddRange(
+                                testUidFilter is null
+                                    ? discoveredTests.Select(test => test.Uid)
+                                    : discoveredTests
+                                        .Where(testUidFilter)
+                                        .Select(test => test.Uid));
+                        }
+                        else
+                        {
+                            await HandleAssemblyTimeoutAsync(
+                                assembly,
+                                discoveredTests,
+                                accumulator.TimedOutTests).ConfigureAwait(false);
+                        }
                     }
                 }
 
@@ -601,13 +1230,33 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         catch (Exception ex)
         {
             _logger.LogDebug(ex, "{RunnerId}: Failed to run tests for mutant ID {MutantId}", RunnerId, mutantId);
-            return new TestRunResult(false, ex.Message);
+            IEnumerable<MtpTestDescription> testDescriptionValues;
+            lock (_discoveryLock)
+            {
+                testDescriptionValues = _testDescriptions.Values.ToList();
+            }
+
+            return TestRunResult.RuntimeError(
+                testDescriptionValues,
+                TestIdentifierList.NoTest(),
+                TestIdentifierList.NoTest(),
+                TestIdentifierList.NoTest(),
+                ex.Message,
+                [],
+                TimeSpan.Zero);
+        }
+        finally
+        {
+            // A missing xUnit finish message must not leave an ordinary
+            // mutation active while the persistent host waits for its next run.
+            WriteMutantIdToFile(-1);
         }
     }
 
     internal virtual async Task<(TestRunResult? Result, bool TimedOut, List<TestNode>? DiscoveredTests)> RunAssemblyTestsAsync(
         string assembly,
-        ITimeoutValueCalculator? timeoutCalc)
+        ITimeoutValueCalculator? timeoutCalc,
+        Func<TestNode, bool>? testUidFilter = null)
     {
         if (!File.Exists(assembly))
         {
@@ -615,19 +1264,23 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         }
 
         var discoveredTests = GetDiscoveredTests(assembly);
-        
+
         TimeSpan? timeout = null;
         if (timeoutCalc is not null && discoveredTests is not null)
         {
-            timeout = CalculateAssemblyTimeout(discoveredTests, timeoutCalc, assembly);
+            // Base the timeout on the tests that will actually run, not the full suite
+            var testsToRun = testUidFilter is null
+                ? discoveredTests
+                : discoveredTests.Where(testUidFilter).ToList();
+            timeout = CalculateAssemblyTimeout(testsToRun, timeoutCalc, assembly);
         }
 
-        var (testResults, timedOut) = await RunAssemblyTestsInternalAsync(assembly, null, timeout).ConfigureAwait(false);
-        
+        var (testResults, timedOut) = await RunAssemblyTestsInternalAsync(assembly, testUidFilter, timeout).ConfigureAwait(false);
+
         return (testResults as TestRunResult, timedOut, discoveredTests);
     }
 
-    internal async Task<(ITestRunResult Result, bool TimedOut)> RunAssemblyTestsInternalAsync(
+    internal virtual async Task<(ITestRunResult Result, bool TimedOut)> RunAssemblyTestsInternalAsync(
         string assembly,
         Func<TestNode, bool>? testUidFilter,
         TimeSpan? timeout = null)
@@ -640,6 +1293,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
 
         for (var attempt = 1; attempt <= maxRunAttempts; attempt++)
         {
+            var acquireStopwatch = Stopwatch.StartNew();
             AssemblyTestServer server;
             try
             {
@@ -666,10 +1320,25 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
 
                 var testsToRun = tests?.Where(t => testUidFilter is null || testUidFilter(t)).ToArray();
 
+                // A filter matching no test in this assembly means the mutant is
+                // covered by tests in another assembly only. Sending an empty
+                // test list would make MTP run the whole assembly.
+                if (testUidFilter is not null && testsToRun is { Length: 0 })
+                {
+                    _logger.LogDebug(
+                        "{RunnerId}: No covering tests in {Assembly}; skipping test run",
+                        RunnerId,
+                        Path.GetFileName(assembly));
+                    return (BuildTestRunResult([], tests?.Count ?? 0, TimeSpan.Zero), false);
+                }
+
                 var (testResults, timedOut) = await server.RunTestsAsync(testsToRun, timeout).ConfigureAwait(false);
 
                 var duration = DateTime.UtcNow - startTime;
-                var result = BuildTestRunResult(testResults, tests?.Count ?? 0, duration);
+                var result = BuildTestRunResult(
+                    NormalizeToDiscoveredCases(testResults, tests),
+                    tests?.Count ?? 0,
+                    duration);
 
                 return (result, timedOut);
             }
@@ -803,16 +1472,21 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 {
                     File.Delete(_mutantFilePath);
                 }
+                DeleteIfExists(_mutantMapFilePath);
+                DeleteIfExists(_mutantMapAcknowledgementFilePath);
+                DeleteIfExists(_mutantMapErrorFilePath);
+                if (File.Exists(_coverageFilePath))
+                {
+                    File.Delete(_coverageFilePath);
+                }
+                DeleteIfExists(_coverageMapFilePath);
             }
             catch (Exception ex)
             {
                 // Ignore cleanup errors
                 _logger.LogWarning(ex, "{RunnerId}: Failed to clean up temp files", RunnerId);
             }
-            DeleteCoverageFiles();
         }
         _disposed = true;
     }
 }
-
-

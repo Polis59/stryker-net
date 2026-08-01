@@ -7,10 +7,18 @@ namespace Stryker
     /// </summary>
     public static class MutantControl
     {
-        private static System.Collections.Generic.List<int> _coveredMutants = new System.Collections.Generic.List<int>();
-        private static System.Collections.Generic.List<int> _coveredStaticMutants = new System.Collections.Generic.List<int>();
+        // Stryker mutates several assemblies per run and injects a copy of this class into each,
+        // but they all execute in one test host. Coverage therefore accumulates in one
+        // process-wide sink shared through AppDomain data: with a private sink per copy, each
+        // copy would overwrite the shared coverage file with only its own assembly's coverage,
+        // and whichever copy flushed last would win, silently dropping the rest. The sink is an
+        // object[3]: covered-mutant set, covered-static-mutant set, and the lock guarding both.
+        // The sets are cleared in place, never reassigned, because every copy holds the same
+        // references. Interned strings give a process-global identity to synchronize creation on.
+        // Initialized to an empty sentinel (never null, for nullable-enabled consumers); the real
+        // three-element sink replaces it on first use.
+        private static object[] _sharedCoverageSink = new object[0];
         private static string envName = string.Empty;
-        private static System.Object _coverageLock = new System.Object();
         // Initialized to avoid nullable warnings/errors
         private static string _cachedMutantFilePath = string.Empty;
         private static bool _mutantFilePathCached;
@@ -33,6 +41,20 @@ namespace Stryker
         private static bool _coverageFilePathCached;
         private static bool _processExitRegistered;
 
+        // Coverage flush control file for the MTP runner's per-test coverage capture. The file holds
+        // two 4-byte ints: a request sequence number at offset 0 (written by the runner) and an
+        // acknowledge sequence number at offset 4 (written by this process). After each single-test
+        // run the runner bumps the request number; a background watcher thread in this process
+        // flushes the coverage accumulated since the previous flush to the coverage file, then
+        // echoes the request number into the acknowledge slot so the runner knows the file is
+        // complete. This is what turns the exit-time coverage flush into a per-test protocol
+        // without restarting the test host between tests.
+        private static string _coverageControlFilePath = string.Empty;
+        // Roots the control-file mapping (typed as object for the C#2 constraint, like _mutantMmf):
+        // if the MemoryMappedFile were collected its finalizer would release the mapping handle out
+        // from under the accessor the watcher thread is still reading.
+        private static object _coverageControlMmf = new System.Object();
+
         // this attribute will be set by the Stryker Data Collector before each test
         public static bool CaptureCoverage;
         public static int ActiveMutant = -2;
@@ -43,20 +65,187 @@ namespace Stryker
             // Check for MTP file-based coverage mode at class initialization
             // Environment variable contains only the filename, not the full path
             string coverageFileName = System.Environment.GetEnvironmentVariable("STRYKER_COVERAGE_FILE") ?? string.Empty;
-            
+
             if (!string.IsNullOrEmpty(coverageFileName))
             {
                 // Construct full path using temp directory
                 _cachedCoverageFilePath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), coverageFileName);
                 _coverageFilePathCached = true;
                 CaptureCoverage = true;
-                
-                // Register for process exit to flush coverage data
-                if (!_processExitRegistered)
+
+                // Exactly one of the injected copies may write the coverage file (see the shared
+                // sink comment above); the first copy whose static constructor runs wins the
+                // election and owns both the exit-time flush and the flush-request watcher. All
+                // copies still register coverage into the shared sink, so the elected writer
+                // flushes everything.
+                // Lifecycle coverage (STRYKER_COVERAGE_MAP_FILE) drains the counters after every
+                // test instead, and a process-exit callback would pin a collectible test load
+                // context for the lifetime of the isolation broker, so neither the exit flush nor
+                // the watcher is registered while that protocol is active.
+                string coverageMapFile = System.Environment.GetEnvironmentVariable("STRYKER_COVERAGE_MAP_FILE") ?? string.Empty;
+                if (string.IsNullOrEmpty(coverageMapFile) && TryElectCoverageWriter())
                 {
-                    System.AppDomain.CurrentDomain.ProcessExit += delegate { FlushCoverageToFile(); };
-                    _processExitRegistered = true;
+                    if (!_processExitRegistered)
+                    {
+                        System.AppDomain.CurrentDomain.ProcessExit += delegate { FlushCoverageToFile(); };
+                        _processExitRegistered = true;
+                    }
+
+                    StartCoverageControlWatcher();
                 }
+            }
+        }
+
+        private static object[] GetSharedCoverageSink()
+        {
+            object[] cached = _sharedCoverageSink;
+            if (cached.Length == 3)
+            {
+                return cached;
+            }
+
+            lock (string.Intern("Stryker.MutantControl.CoverageSink.Lock.v1"))
+            {
+                object existing = System.AppDomain.CurrentDomain.GetData("Stryker.MutantControl.CoverageSink.v1") ?? new System.Object();
+                object[] sink;
+                if (existing is object[] && ((object[])existing).Length == 3)
+                {
+                    sink = (object[])existing;
+                }
+                else
+                {
+                    sink = new object[]
+                    {
+                        new System.Collections.Generic.HashSet<int>(),
+                        new System.Collections.Generic.HashSet<int>(),
+                        new System.Object()
+                    };
+                    System.AppDomain.CurrentDomain.SetData("Stryker.MutantControl.CoverageSink.v1", sink);
+                }
+
+                _sharedCoverageSink = sink;
+                return sink;
+            }
+        }
+
+        private static bool TryElectCoverageWriter()
+        {
+            lock (string.Intern("Stryker.MutantControl.CoverageSink.Lock.v1"))
+            {
+                if (System.AppDomain.CurrentDomain.GetData("Stryker.MutantControl.CoverageWriter.v1") != null)
+                {
+                    return false;
+                }
+
+                System.AppDomain.CurrentDomain.SetData("Stryker.MutantControl.CoverageWriter.v1", "elected");
+                return true;
+            }
+        }
+
+        private static void StartCoverageControlWatcher()
+        {
+            // Environment variable contains only the filename; the runner puts the file in the temp
+            // directory, next to the coverage file. Absent variable means the runner is capturing
+            // aggregate coverage via the exit-time flush only, so no watcher is needed.
+            string controlFileName = System.Environment.GetEnvironmentVariable("STRYKER_COVERAGE_CONTROL_FILE") ?? string.Empty;
+            if (string.IsNullOrEmpty(controlFileName))
+            {
+                return;
+            }
+
+            _coverageControlFilePath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), controlFileName);
+
+            System.Threading.Thread watcher = new System.Threading.Thread(new System.Threading.ThreadStart(CoverageControlLoop));
+            watcher.IsBackground = true;
+            watcher.Name = "StrykerCoverageControlWatcher";
+            watcher.Start();
+        }
+
+        private static void CoverageControlLoop()
+        {
+            // Typed as object with a non-null sentinel (like _mutantAccessor above) so the injected
+            // source stays warning-free under nullable analysis; _mapped tells the two states apart.
+            object accessorHolder = new System.Object();
+            bool mapped = false;
+            int lastHandled = 0;
+
+            while (true)
+            {
+                try
+                {
+                    if (!mapped)
+                    {
+                        if (!System.IO.File.Exists(_coverageControlFilePath))
+                        {
+                            System.Threading.Thread.Sleep(50);
+                            continue;
+                        }
+
+                        // FileShare.ReadWrite lets the runner keep writing request numbers while this
+                        // process keeps the file mapped; leaveOpen: false ties the stream's lifetime
+                        // to the mapping.
+                        System.IO.FileStream stream = new System.IO.FileStream(
+                            _coverageControlFilePath,
+                            System.IO.FileMode.Open,
+                            System.IO.FileAccess.ReadWrite,
+                            System.IO.FileShare.ReadWrite);
+
+                        System.IO.MemoryMappedFiles.MemoryMappedFile mmf = System.IO.MemoryMappedFiles.MemoryMappedFile.CreateFromFile(
+                            stream,
+                            null,
+                            8,
+                            System.IO.MemoryMappedFiles.MemoryMappedFileAccess.ReadWrite,
+                            System.IO.HandleInheritability.None,
+                            false);
+
+                        System.IO.MemoryMappedFiles.MemoryMappedViewAccessor createdAccessor =
+                            mmf.CreateViewAccessor(0, 8, System.IO.MemoryMappedFiles.MemoryMappedFileAccess.ReadWrite);
+
+                        _coverageControlMmf = mmf;
+                        accessorHolder = createdAccessor;
+                        mapped = true;
+
+                        // Resume from the acknowledge slot rather than zero so a watcher restarted
+                        // after a transient mapping failure does not re-acknowledge (and re-reset)
+                        // coverage for a request that was already served.
+                        lastHandled = createdAccessor.ReadInt32(4);
+                    }
+
+                    System.IO.MemoryMappedFiles.MemoryMappedViewAccessor accessor =
+                        (System.IO.MemoryMappedFiles.MemoryMappedViewAccessor)accessorHolder;
+                    int requested = accessor.ReadInt32(0);
+                    if (requested != lastHandled)
+                    {
+                        // Write the coverage accumulated since the previous flush, then acknowledge.
+                        // Ordering matters: the runner only reads the coverage file after seeing the
+                        // acknowledge slot match its request number.
+                        FlushCoverageToFile();
+                        accessor.Write(4, requested);
+                        accessor.Flush();
+                        lastHandled = requested;
+                    }
+                }
+                catch (System.Exception)
+                {
+                    // The mapping became unusable (e.g. the runner deleted the file between runs);
+                    // drop it and retry, so a fresh control file re-establishes the protocol.
+                    if (mapped)
+                    {
+                        try
+                        {
+                            ((System.IDisposable)accessorHolder).Dispose();
+                        }
+                        catch (System.Exception)
+                        {
+                            // Nothing further to release.
+                        }
+                        accessorHolder = new System.Object();
+                        mapped = false;
+                    }
+                    System.Threading.Thread.Sleep(50);
+                }
+
+                System.Threading.Thread.Sleep(1);
             }
         }
 
@@ -67,8 +256,13 @@ namespace Stryker
 
         public static void ResetCoverage()
         {
-            _coveredMutants = new System.Collections.Generic.List<int>();
-            _coveredStaticMutants = new System.Collections.Generic.List<int>();
+            object[] sink = GetSharedCoverageSink();
+            lock (sink[2])
+            {
+                // Clear in place: every injected copy holds references to these same lists.
+                ((System.Collections.Generic.HashSet<int>)sink[0]).Clear();
+                ((System.Collections.Generic.HashSet<int>)sink[1]).Clear();
+            }
         }
 
         public static void ResetActiveMutant()
@@ -76,6 +270,8 @@ namespace Stryker
             ActiveMutant = ActiveMutantNotInitValue;
         }
 
+        /// <summary>
+        /// <summary>
         public static void SetActiveMutantViaEnvironmentVariable(int mutantId)
         {
             // Ensure we never assign null to a non-nullable string
@@ -206,9 +402,18 @@ namespace Stryker
 
         public static System.Collections.Generic.IList<int>[] GetCoverageData()
         {
-            System.Collections.Generic.IList<int>[] result = new System.Collections.Generic.IList<int>[] { _coveredMutants, _coveredStaticMutants };
-            ResetCoverage();
-            return result;
+            object[] sink = GetSharedCoverageSink();
+            System.Collections.Generic.List<int> covered;
+            System.Collections.Generic.List<int> coveredStatic;
+            lock (sink[2])
+            {
+                covered = new System.Collections.Generic.List<int>((System.Collections.Generic.HashSet<int>)sink[0]);
+                coveredStatic = new System.Collections.Generic.List<int>((System.Collections.Generic.HashSet<int>)sink[1]);
+                ((System.Collections.Generic.HashSet<int>)sink[0]).Clear();
+                ((System.Collections.Generic.HashSet<int>)sink[1]).Clear();
+            }
+
+            return new System.Collections.Generic.IList<int>[] { covered, coveredStatic };
         }
 
         /// <summary>
@@ -237,13 +442,15 @@ namespace Stryker
 
             try
             {
-                lock (_coverageLock)
+                object[] sink = GetSharedCoverageSink();
+                lock (sink[2])
                 {
-                    string covered = string.Join(",", _coveredMutants);
-                    string staticMutants = string.Join(",", _coveredStaticMutants);
+                    string covered = string.Join(",", (System.Collections.Generic.HashSet<int>)sink[0]);
+                    string staticMutants = string.Join(",", (System.Collections.Generic.HashSet<int>)sink[1]);
                     string content = covered + ";" + staticMutants;
                     System.IO.File.WriteAllText(_cachedCoverageFilePath, content);
-                    ResetCoverage();
+                    ((System.Collections.Generic.HashSet<int>)sink[0]).Clear();
+                    ((System.Collections.Generic.HashSet<int>)sink[1]).Clear();
                 }
             }
             catch (System.Exception ex)
@@ -251,12 +458,6 @@ namespace Stryker
                 // Do not fail tests due to coverage write issues; log for diagnostics instead.
                 System.Diagnostics.Debug.WriteLine(string.Format("[Stryker] Failed to flush coverage to file '{0}': {1}", _cachedCoverageFilePath, ex));
             }
-        }
-
-        private static void CurrentDomain_ProcessExit(object sender, System.EventArgs e)
-        {
-            System.GC.KeepAlive(_coveredMutants);
-            System.GC.KeepAlive(_coveredStaticMutants);
         }
 
         // check with: Stryker.MutantControl.IsActive(ID)
@@ -268,17 +469,18 @@ namespace Stryker
                 return false;
             }
 
-            // Check for file-based mutant control (used by MTP runner for process reuse)
-            // Cache check: only call TryReadMutantFromFile if we might be using file-based control
+            // File-based mutant control (used by the MTP runner's persistent test hosts):
+            // the runner writes the whole-session mutant id before each run request, and the
+            // memory-mapped read below is a plain memory access, cheap enough for this hot
+            // path while always reflecting the latest value the runner wrote.
             if (!_mutantFilePathCached || !string.IsNullOrEmpty(_cachedMutantFilePath))
             {
                 int fileMutantId;
                 if (TryReadMutantFromFile(out fileMutantId))
                 {
-                    ActiveMutant = fileMutantId;
+                    return id == fileMutantId;
                 }
 
-                // If we cached the file path and it's set, always use file-based control
                 if (_mutantFilePathCached && !string.IsNullOrEmpty(_cachedMutantFilePath))
                 {
                     return id == ActiveMutant;
@@ -313,15 +515,15 @@ namespace Stryker
 
         private static void RegisterCoverage(int id)
         {
-            lock (_coverageLock)
+            object[] sink = GetSharedCoverageSink();
+            lock (sink[2])
             {
-                if (!_coveredMutants.Contains(id))
+                System.Collections.Generic.HashSet<int> covered = (System.Collections.Generic.HashSet<int>)sink[0];
+                covered.Add(id);
+                if (MutantContext.InStatic())
                 {
-                    _coveredMutants.Add(id);
-                }
-                if (MutantContext.InStatic() && !_coveredStaticMutants.Contains(id))
-                {
-                    _coveredStaticMutants.Add(id);
+                    System.Collections.Generic.HashSet<int> coveredStatic = (System.Collections.Generic.HashSet<int>)sink[1];
+                    coveredStatic.Add(id);
                 }
             }
         }
