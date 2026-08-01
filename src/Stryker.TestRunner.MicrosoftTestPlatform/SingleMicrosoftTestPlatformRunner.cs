@@ -149,7 +149,13 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 update,
                 timeoutCalc,
                 testUidFilter,
-                useFreshProcess: RequiresProcessIsolation(mutant)).ConfigureAwait(false);
+                useFreshProcess: RequiresProcessIsolation(mutant),
+                // Every test of the request runs under the one active mutant, so the first
+                // failing, erroring, or timing-out test resolves it: stock's first-failure
+                // bail, cancelling the remaining tests mid-stream.
+                bailPredicate: static update =>
+                    update.Node.ExecutionState is TestNodeStates.Failed or TestNodeStates.Error or TestNodeStates.TimedOut)
+                .ConfigureAwait(false);
         }
 
         return lastResult!;
@@ -793,7 +799,8 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         RunAssemblyTestsInFreshProcessAsync(
             string assembly,
             ITimeoutValueCalculator? timeoutCalc,
-            Func<TestNode, bool>? testUidFilter)
+            Func<TestNode, bool>? testUidFilter,
+            Func<TestNodeUpdate, bool>? bailPredicate = null)
     {
         if (!File.Exists(assembly))
         {
@@ -838,7 +845,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             }
 
             var (testResults, timedOut) = await server
-                .RunTestsAsync(testsToRun.ToArray(), timeout)
+                .RunTestsAsync(testsToRun.ToArray(), timeout, bailPredicate, stallDetection: false)
                 .ConfigureAwait(false);
             var result = BuildTestRunResult(
                 NormalizeToDiscoveredCases(testResults, discoveredTests),
@@ -1118,7 +1125,8 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         TestUpdateHandler? update,
         ITimeoutValueCalculator? timeoutCalc = null,
         Func<TestNode, bool>? testUidFilter = null,
-        bool useFreshProcess = false)
+        bool useFreshProcess = false,
+        Func<TestNodeUpdate, bool>? bailPredicate = null)
     {
         try
         {
@@ -1137,11 +1145,13 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                         ? await RunAssemblyTestsInFreshProcessAsync(
                             assembly,
                             timeoutCalc,
-                            testUidFilter).ConfigureAwait(false)
+                            testUidFilter,
+                            bailPredicate).ConfigureAwait(false)
                         : await RunAssemblyTestsAsync(
                             assembly,
                             timeoutCalc,
-                            testUidFilter).ConfigureAwait(false);
+                            testUidFilter,
+                            bailPredicate).ConfigureAwait(false);
 
                 if (discoveredTests is not null)
                 {
@@ -1256,7 +1266,8 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     internal virtual async Task<(TestRunResult? Result, bool TimedOut, List<TestNode>? DiscoveredTests)> RunAssemblyTestsAsync(
         string assembly,
         ITimeoutValueCalculator? timeoutCalc,
-        Func<TestNode, bool>? testUidFilter = null)
+        Func<TestNode, bool>? testUidFilter = null,
+        Func<TestNodeUpdate, bool>? bailPredicate = null)
     {
         if (!File.Exists(assembly))
         {
@@ -1275,7 +1286,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             timeout = CalculateAssemblyTimeout(testsToRun, timeoutCalc, assembly);
         }
 
-        var (testResults, timedOut) = await RunAssemblyTestsInternalAsync(assembly, testUidFilter, timeout).ConfigureAwait(false);
+        var (testResults, timedOut) = await RunAssemblyTestsInternalAsync(assembly, testUidFilter, timeout, bailPredicate).ConfigureAwait(false);
 
         return (testResults as TestRunResult, timedOut, discoveredTests);
     }
@@ -1283,7 +1294,8 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     internal virtual async Task<(ITestRunResult Result, bool TimedOut)> RunAssemblyTestsInternalAsync(
         string assembly,
         Func<TestNode, bool>? testUidFilter,
-        TimeSpan? timeout = null)
+        TimeSpan? timeout = null,
+        Func<TestNodeUpdate, bool>? bailPredicate = null)
     {
         // A crashed test host tears down the RPC connection, so the run throws (rather than timing out).
         // Retry once on a freshly started server: a crash caused by a *previous* mutant then self-heals
@@ -1332,7 +1344,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                     return (BuildTestRunResult([], tests?.Count ?? 0, TimeSpan.Zero), false);
                 }
 
-                var (testResults, timedOut) = await server.RunTestsAsync(testsToRun, timeout).ConfigureAwait(false);
+                var (testResults, timedOut) = await server.RunTestsAsync(testsToRun, timeout, bailPredicate, stallDetection: false).ConfigureAwait(false);
 
                 var duration = DateTime.UtcNow - startTime;
                 var result = BuildTestRunResult(

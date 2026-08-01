@@ -131,7 +131,11 @@ internal sealed class AssemblyTestServer : IDisposable
         return results;
     }
 
-    public async Task<(List<TestNodeUpdate> Results, bool TimedOut)> RunTestsAsync(TestNode[]? testsToRun, TimeSpan? timeout)
+    public async Task<(List<TestNodeUpdate> Results, bool TimedOut)> RunTestsAsync(
+        TestNode[]? testsToRun,
+        TimeSpan? timeout,
+        Func<TestNodeUpdate, bool>? bailPredicate = null,
+        bool stallDetection = true)
     {
         if (!_isInitialized || _client is null)
         {
@@ -139,29 +143,101 @@ internal sealed class AssemblyTestServer : IDisposable
         }
 
         var runId = Guid.NewGuid();
+        var stageStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        long firstUpdateMs = -1;
         var testResults = new System.Collections.Concurrent.ConcurrentBag<TestNodeUpdate>();
+
+        // Bail: when a streamed update proves the session's mutant is already killed, cancel the
+        // run request. StreamJsonRpc turns the cancellation into a notification the test server
+        // honours; the results collected so far carry the killing test. Should the server ignore
+        // the cancellation, the RPC call simply completes normally and nothing is lost but time.
+        using var bailSource = new CancellationTokenSource();
+        var bailed = false;
+        var stalled = false;
+        var lastUpdateTicks = Environment.TickCount64;
 
         Func<TestNodeUpdate[], Task> onUpdate = updates =>
         {
+            if (firstUpdateMs < 0)
+            {
+                firstUpdateMs = stageStopwatch.ElapsedMilliseconds;
+            }
+
+            Volatile.Write(ref lastUpdateTicks, Environment.TickCount64);
+
             foreach (var update in updates)
             {
                 testResults.Add(update);
             }
+
+            if (bailPredicate is not null && !bailed && updates.Any(bailPredicate))
+            {
+                bailed = true;
+                _logger.LogDebug("{RunnerId}: Bailing out of test run for {Assembly}: a test already failed", _runnerId, _assembly);
+                bailSource.Cancel();
+            }
+
             return Task.CompletedTask;
         };
 
         if (timeout.HasValue)
         {
+            // Stall detection: a healthy mutant session streams results continuously (first
+            // update within a second, then a steady flow), while a hanging mutant goes silent.
+            // Cancelling on silence converts a hang's cost from the whole session budget to
+            // roughly the stall window, with the same honest Timeout verdict. The window is
+            // wider before the first update to leave room for a cold host's session build.
+            using var stallMonitorSource = new CancellationTokenSource();
+            if (!stallDetection)
+            {
+                stallMonitorSource.Cancel();
+            }
+            _ = Task.Run(async () =>
+            {
+                while (!stallMonitorSource.Token.IsCancellationRequested)
+                {
+                    try
+                    {
+                        await Task.Delay(1000, stallMonitorSource.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
+
+                    var silenceMs = Environment.TickCount64 - Volatile.Read(ref lastUpdateTicks);
+                    var limitMs = Interlocked.Read(ref firstUpdateMs) < 0 ? 30_000 : 10_000;
+                    if (silenceMs > limitMs)
+                    {
+                        stalled = true;
+                        _logger.LogDebug(
+                            "{RunnerId}: Test run stalled ({SilenceMs} ms without an update) for {Assembly}; cancelling",
+                            _runnerId, silenceMs, _assembly);
+                        bailSource.Cancel();
+                        return;
+                    }
+                }
+            });
+
             ResponseListener executeTestsResponse;
             try
             {
                 // The RPC call itself can block when the server is stuck (e.g. infinite loop in mutated code)
-                executeTestsResponse = await _client.RunTestsAsync(runId, onUpdate, testsToRun, timeout.Value)
+                executeTestsResponse = await _client.RunTestsAsync(runId, onUpdate, testsToRun, timeout.Value, bailSource.Token)
                     .WaitAsync(timeout.Value).ConfigureAwait(false);
             }
             catch (TimeoutException ex)
             {
                 _logger.LogDebug(ex, "{RunnerId}: Test run RPC call timed out for {Assembly}", _runnerId, _assembly);
+                return (testResults.ToList(), true);
+            }
+            catch (OperationCanceledException) when (bailed)
+            {
+                return (testResults.ToList(), false);
+            }
+            catch (OperationCanceledException ex) when (stalled)
+            {
+                _logger.LogDebug(ex, "{RunnerId}: Test run cancelled after stalling for {Assembly}", _runnerId, _assembly);
                 return (testResults.ToList(), true);
             }
             catch (OperationCanceledException ex)
@@ -173,20 +249,57 @@ internal sealed class AssemblyTestServer : IDisposable
                 return (testResults.ToList(), true);
             }
 
-            var completionTask = executeTestsResponse.WaitCompletionAsync(timeout.Value);
-            await Task.WhenAny(completionTask, _process!.WaitForExitAsync()).ConfigureAwait(false);
+            var completionTask = executeTestsResponse.WaitCompletionAsync(timeout.Value, bailSource.Token);
+            await Task.WhenAny(completionTask, HostExitAsync()).ConfigureAwait(false);
+            if (bailed)
+            {
+                return (testResults.ToList(), false);
+            }
+
+            if (stalled)
+            {
+                return (testResults.ToList(), true);
+            }
+
             ThrowIfHostCrashed(completionTask);
 
-            var completed = await completionTask.ConfigureAwait(false);
+            bool completed;
+            try
+            {
+                completed = await completionTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (stalled)
+            {
+                return (testResults.ToList(), true);
+            }
+
+            _logger.LogInformation("{RunnerId}: RUNSTAGE firstUpdateMs={FirstUpdate} totalMs={Total} results={Results}",
+                _runnerId, firstUpdateMs, stageStopwatch.ElapsedMilliseconds, testResults.Count);
             return (testResults.ToList(), !completed);
         }
 
-        var response = await _client.RunTestsAsync(runId, onUpdate, testsToRun).ConfigureAwait(false);
+        ResponseListener response;
+        try
+        {
+            response = await _client.RunTestsAsync(runId, onUpdate, testsToRun, null, bailSource.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (bailed)
+        {
+            return (testResults.ToList(), false);
+        }
+
         var responseCompletion = response.WaitCompletionAsync();
-        await Task.WhenAny(responseCompletion, _process!.WaitForExitAsync()).ConfigureAwait(false);
+        await Task.WhenAny(responseCompletion, HostExitAsync()).ConfigureAwait(false);
+        if (bailed)
+        {
+            return (testResults.ToList(), false);
+        }
+
         ThrowIfHostCrashed(responseCompletion);
 
         await responseCompletion.ConfigureAwait(false);
+        _logger.LogInformation("{RunnerId}: RUNSTAGE firstUpdateMs={FirstUpdate} totalMs={Total} results={Results}",
+            _runnerId, firstUpdateMs, stageStopwatch.ElapsedMilliseconds, testResults.Count);
         return (testResults.ToList(), false);
     }
 
@@ -195,6 +308,14 @@ internal sealed class AssemblyTestServer : IDisposable
     /// run completed. A crashed host never sends a completion signal, so without this check the run would
     /// otherwise wait out the full timeout and be misreported as a timeout instead of a runtime error.
     /// </summary>
+    /// <summary>
+    /// A task that completes when the test host process exits, or never when the server
+    /// runs without a real process (unit-test doubles drive `RunTestsAsync` directly).
+    /// The crash race in <see cref="ThrowIfHostCrashed"/> is likewise process-optional.
+    /// </summary>
+    private Task HostExitAsync() =>
+        _process?.WaitForExitAsync() ?? new TaskCompletionSource().Task;
+
     private void ThrowIfHostCrashed(Task runCompletion)
     {
         if (_process is { HasExited: true } && !runCompletion.IsCompletedSuccessfully)
