@@ -312,15 +312,13 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             }
 
             // A session that dies with a runtime issue must not hand the mutant a
-            // terminal RuntimeError verdict on one attempt. The warm host dies when
-            // whole-session activation mutates validation its lazily initialized
-            // statics depend on, and the fresh isolation process intermittently dies
-            // with a native fault; in both cases a pristine fresh process still
-            // produces a real verdict, because a mutation that breaks initialization
-            // there surfaces as failing tests. The retry therefore always runs in a
-            // fresh process. A mutation that kills even the pristine process fails
-            // both attempts and keeps its RuntimeError, and a timeout is a verdict
-            // of its own and is never retried.
+            // terminal RuntimeError verdict on one attempt. The retry uses a pristine
+            // process and lets the bounded assessing set complete: first-failure bail
+            // cancels the MTP request before the host acknowledges completion, and
+            // repeating that cancellation race would not provide independent evidence.
+            // A mutation that kills even the pristine process without bail fails both
+            // attempts and keeps its RuntimeError. A timeout is a verdict of its own
+            // and is never retried.
             const int maxAttempts = 2;
             for (var attempt = 1; attempt <= maxAttempts; attempt++)
             {
@@ -332,11 +330,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                     timeoutCalc,
                     testUidFilter,
                     useFreshProcess: RequiresProcessIsolation(mutant) || attempt > 1,
-                    // Every test of the request runs under the one active mutant, so the first
-                    // failing, erroring, or timing-out test resolves it: stock's first-failure
-                    // bail, cancelling the remaining tests mid-stream.
-                    bailPredicate: static update =>
-                        update.Node.ExecutionState is TestNodeStates.Failed or TestNodeStates.Error or TestNodeStates.TimedOut)
+                    bailPredicate: CreateSingleMutantBailPredicate(isRuntimeRetry: attempt > 1))
                     .ConfigureAwait(false);
                 if (!lastResult.SessionHadRuntimeIssue || attempt == maxAttempts)
                 {
@@ -355,6 +349,12 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
 
         return lastResult!;
     }
+
+    internal static Func<TestNodeUpdate, bool>? CreateSingleMutantBailPredicate(bool isRuntimeRetry) =>
+        isRuntimeRetry
+            ? null
+            : static update =>
+                update.Node.ExecutionState is TestNodeStates.Failed or TestNodeStates.Error or TestNodeStates.TimedOut;
 
     private Func<TestNode, bool>? BuildTestUidFilter(IReadOnlyList<IMutant> mutants)
     {
