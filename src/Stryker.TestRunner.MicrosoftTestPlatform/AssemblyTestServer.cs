@@ -134,7 +134,8 @@ internal sealed class AssemblyTestServer : IDisposable
     public async Task<(List<TestNodeUpdate> Results, bool TimedOut)> RunTestsAsync(
         TestNode[]? testsToRun,
         TimeSpan? timeout,
-        Func<TestNodeUpdate, bool>? bailPredicate = null)
+        Func<TestNodeUpdate, bool>? bailPredicate = null,
+        bool stallDetection = true)
     {
         if (!_isInitialized || _client is null)
         {
@@ -187,6 +188,10 @@ internal sealed class AssemblyTestServer : IDisposable
             // roughly the stall window, with the same honest Timeout verdict. The window is
             // wider before the first update to leave room for a cold host's session build.
             using var stallMonitorSource = new CancellationTokenSource();
+            if (!stallDetection)
+            {
+                stallMonitorSource.Cancel();
+            }
             _ = Task.Run(async () =>
             {
                 while (!stallMonitorSource.Token.IsCancellationRequested)

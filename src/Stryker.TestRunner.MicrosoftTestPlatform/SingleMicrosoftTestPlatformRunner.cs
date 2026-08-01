@@ -1141,6 +1141,96 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 OutsideTestMutants.Concat(other.OutsideTestMutants).Distinct().ToList());
     }
 
+    /// <summary>
+    /// Tests one isolation-required mutant in a dedicated, freshly spawned test-server
+    /// process (the approach proposed in
+    /// https://github.com/stryker-mutator/stryker-net/pull/3695): the mutant id is
+    /// published to the control file before the process starts, so its statics
+    /// initialize under the active mutation, and the process is discarded afterwards.
+    /// Unlike a collectible load context, a fresh process keeps ReadyToRun native code
+    /// for the framework stack, and measured campaigns show statics that timed out in
+    /// collectible contexts complete with real verdicts here.
+    /// </summary>
+    private async Task<(TestRunResult? Result, bool TimedOut, List<TestNode>? DiscoveredTests)>
+        RunAssemblyTestsInFreshProcessAsync(
+            string assembly,
+            ITimeoutValueCalculator? timeoutCalc,
+            Func<TestNode, bool>? testUidFilter)
+    {
+        if (!File.Exists(assembly))
+        {
+            return (null, false, null);
+        }
+
+        var discoveredTests = GetDiscoveredTests(assembly);
+        if (discoveredTests is null)
+        {
+            return (
+                new TestRunResult(false, $"No discovered tests were available for '{assembly}'."),
+                false,
+                null);
+        }
+
+        var testsToRun = testUidFilter is null
+            ? discoveredTests
+            : discoveredTests.Where(testUidFilter).ToList();
+        if (testUidFilter is not null && testsToRun.Count == 0)
+        {
+            return (BuildTestRunResult([], discoveredTests.Count, TimeSpan.Zero), false, discoveredTests);
+        }
+
+        // Exact budget with a cold-start allowance: the dedicated process pays spawn and
+        // session build before its first result, and its tests run with xUnit's normal
+        // parallelism because the lone mutant is active for the whole process.
+        TimeSpan? timeout = timeoutCalc is null
+            ? null
+            : TimeSpan.FromMilliseconds(20_000 + (100 * testsToRun.Count));
+
+        var stopwatch = Stopwatch.StartNew();
+        var server = new AssemblyTestServer(assembly, BuildEnvironmentVariables(), _logger, RunnerId, _options);
+        try
+        {
+            var started = await server.StartAsync().ConfigureAwait(false);
+            if (!started)
+            {
+                return (
+                    new TestRunResult(false, $"Failed to start the dedicated test server for {assembly}."),
+                    false,
+                    discoveredTests);
+            }
+
+            // Any failing, erroring, or timing-out test resolves the process's lone mutant:
+            // stock's first-failure bail.
+            Func<TestNodeUpdate, bool> bailPredicate = update =>
+                update.Node.ExecutionState is TestNodeStates.Failed or TestNodeStates.Error or TestNodeStates.TimedOut;
+
+            var (testResults, timedOut) = await server
+                .RunTestsAsync(testsToRun.ToArray(), timeout, bailPredicate, stallDetection: false)
+                .ConfigureAwait(false);
+            var result = BuildTestRunResult(
+                NormalizeToDiscoveredCases(testResults, discoveredTests),
+                discoveredTests.Count,
+                stopwatch.Elapsed);
+            return (result, timedOut, discoveredTests);
+        }
+        catch (Exception ex)
+        {
+            return (new TestRunResult(false, ex.Message), false, discoveredTests);
+        }
+        finally
+        {
+            try
+            {
+                await server.StopAsync(force: true).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "{RunnerId}: Failed to stop the dedicated test server for {Assembly}", RunnerId, assembly);
+            }
+            server.Dispose();
+        }
+    }
+
     private async Task<AssemblyTestServer> GetOrCreateServerAsync(string assembly)
     {
         AssemblyTestServer? deadServer = null;
@@ -1505,7 +1595,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             {
                 var (result, timedOut, discoveredTests) =
                     useCollectibleIsolation
-                        ? await RunAssemblyTestsInCollectibleContextAsync(
+                        ? await RunAssemblyTestsInFreshProcessAsync(
                             assembly,
                             timeoutCalc,
                             testUidFilter).ConfigureAwait(false)
@@ -1515,7 +1605,14 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                             testUidFilter,
                             serialActivation: mutants is not null && !inactiveMap && !parallelMultiplexed,
                             bailPredicate: bailPredicate,
-                            parallelMutantSession: mutants is not null && (inactiveMap || parallelMultiplexed)).ConfigureAwait(false);
+                            // Whole-session single-mutant runs deliberately take the generous
+                            // default floor and no stall detection: they are the campaign's
+                            // truth court. A multiplexed batch that cannot afford a slow mutant
+                            // times out cheaply and defers it here, where the mutant may run
+                            // minutes if that is what an honest verdict costs. Only a mutant
+                            // that exhausts even this budget earns Timeout.
+                            parallelMutantSession: mutants is not null && parallelMultiplexed,
+                            stallDetection: !wholeSessionActivation).ConfigureAwait(false);
 
                 if (discoveredTests is not null)
                 {
@@ -1532,6 +1629,18 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                                     : discoveredTests
                                         .Where(testUidFilter)
                                         .Select(test => test.Uid));
+                        }
+                        else if (parallelMultiplexed && mutants is { Count: > 1 })
+                        {
+                            // A timed-out multi-mutant parallel batch must not blanket-stamp
+                            // its tests: mutants killed by completed failures keep their kills,
+                            // mutants whose full set ran clean keep survival, and everyone with
+                            // incomplete evidence stays pending and is re-tried individually in
+                            // the whole-session truth court above. Stamping every discovered
+                            // test as timed out here would instead hand all unresolved mutants
+                            // a direct Timeout verdict the budget - not the mutant - earned.
+                            // The wedged host is still discarded.
+                            await DiscardServerAsync(assembly).ConfigureAwait(false);
                         }
                         else
                         {
@@ -1787,7 +1896,8 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         Func<TestNode, bool>? testUidFilter = null,
         bool serialActivation = false,
         Func<TestNodeUpdate, bool>? bailPredicate = null,
-        bool parallelMutantSession = false)
+        bool parallelMutantSession = false,
+        bool stallDetection = true)
     {
         if (!File.Exists(assembly))
         {
@@ -1806,7 +1916,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             timeout = CalculateAssemblyTimeout(testsToRun, timeoutCalc, assembly, serialActivation, parallelMutantSession);
         }
 
-        var (testResults, timedOut) = await RunAssemblyTestsInternalAsync(assembly, testUidFilter, timeout, bailPredicate).ConfigureAwait(false);
+        var (testResults, timedOut) = await RunAssemblyTestsInternalAsync(assembly, testUidFilter, timeout, bailPredicate, stallDetection).ConfigureAwait(false);
 
         return (testResults as TestRunResult, timedOut, discoveredTests);
     }
@@ -1815,7 +1925,8 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         string assembly,
         Func<TestNode, bool>? testUidFilter,
         TimeSpan? timeout = null,
-        Func<TestNodeUpdate, bool>? bailPredicate = null)
+        Func<TestNodeUpdate, bool>? bailPredicate = null,
+        bool stallDetection = true)
     {
         // A crashed test host tears down the RPC connection, so the run throws (rather than timing out).
         // Retry once on a freshly started server: a crash caused by a *previous* mutant then self-heals
@@ -1866,7 +1977,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
 
                 var acquireMs = acquireStopwatch.ElapsedMilliseconds;
                 var runStopwatch = Stopwatch.StartNew();
-                var (testResults, timedOut) = await server.RunTestsAsync(testsToRun, timeout, bailPredicate).ConfigureAwait(false);
+                var (testResults, timedOut) = await server.RunTestsAsync(testsToRun, timeout, bailPredicate, stallDetection).ConfigureAwait(false);
                 _logger.LogInformation(
                     "{RunnerId}: SESSIONSTAGE acquireMs={AcquireMs} runMs={RunMs} testsRequested={Requested} resultsReturned={Returned} timedOut={TimedOut}",
                     RunnerId, acquireMs, runStopwatch.ElapsedMilliseconds, testsToRun?.Length ?? -1, testResults.Count, timedOut);
