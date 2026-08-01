@@ -449,29 +449,37 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 DeleteCoverageMapFile();
 
                 var execution = await ExecuteCoverageProcessAsync(assembly, tests).ConfigureAwait(false);
-                if (execution.TimedOut)
-                {
-                    throw new TimeoutException(
-                        "The coverage capture process exceeded its execution timeout.");
-                }
-
-                var hostLoss = string.IsNullOrWhiteSpace(execution.Error) ? null : execution.Error;
-                if (hostLoss is not null)
+                // A timed-out capture retries exactly like a lost host: a boundary can
+                // wedge on a load-induced race in the code under test rather than on
+                // anything this boundary does deterministically, and a fresh host on a
+                // second attempt usually completes. A boundary that exhausts both
+                // attempts still fails the campaign closed with its name, because
+                // proceeding without its coverage would silently un-cover its tests.
+                var transientFault = execution.TimedOut
+                    ? "The coverage capture process exceeded its execution timeout."
+                    : string.IsNullOrWhiteSpace(execution.Error) ? null : execution.Error;
+                if (transientFault is not null)
                 {
                     if (attempt < maxCaptureAttempts)
                     {
                         _logger.LogWarning(
-                            "{RunnerId}: Coverage capture for boundary {Boundary} lost its isolation host " +
+                            "{RunnerId}: Coverage capture for boundary {Boundary} failed " +
                             "(attempt {Attempt}/{MaxAttempts}); retrying on a fresh host: {Error}",
                             RunnerId,
                             tests[0].DisplayName,
                             attempt,
                             maxCaptureAttempts,
-                            hostLoss);
+                            transientFault);
                         continue;
                     }
 
-                    throw new InvalidOperationException(AppendSinkError(hostLoss));
+                    if (execution.TimedOut)
+                    {
+                        throw new TimeoutException(
+                            $"Coverage capture for boundary '{tests[0].DisplayName}' timed out on every attempt.");
+                    }
+
+                    throw new InvalidOperationException(AppendSinkError(transientFault));
                 }
 
                 IReadOnlyList<ICoverageRunResult> results;
