@@ -91,6 +91,15 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
 
     public ITestSet GetTests(IProjectAndTests project) => _testSet;
 
+    // Solution mode runs one initial suite pass per mutated project, and those projects
+    // commonly share a single test assembly. Concurrent initial passes oversubscribe the
+    // machine (each host parallelizes to the core count on its own), which flakes
+    // timing-sensitive tests and inflates the baseline durations that size every later
+    // timeout budget. One initial pass at a time costs little wall clock - the passes
+    // were slowing each other down - and produces honest baselines. Static: the gate
+    // spans the per-project pools of one solution run.
+    private static readonly SemaphoreSlim InitialRunGate = new(1, 1);
+
     public async Task<ITestRunResult> InitialTestAsync(IProjectAndTests project)
     {
         var assemblies = project.GetTestAssemblies();
@@ -99,7 +108,16 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
             return new TestRunResult(false, "No test assemblies found");
         }
 
-        var results = await RunThisAsync(runner => runner.InitialTestAsync(project)).ConfigureAwait(false);
+        await InitialRunGate.WaitAsync().ConfigureAwait(false);
+        ITestRunResult results;
+        try
+        {
+            results = await RunThisAsync(runner => runner.InitialTestAsync(project)).ConfigureAwait(false);
+        }
+        finally
+        {
+            InitialRunGate.Release();
+        }
 
         // reset all test processes after the initial test run
         ResetTestProcesses();
