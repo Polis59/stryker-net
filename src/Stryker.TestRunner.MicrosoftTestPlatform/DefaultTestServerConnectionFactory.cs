@@ -17,11 +17,45 @@ internal sealed class DefaultTestServerConnectionFactory : ITestServerConnection
 {
     private readonly string? _outputPath;
     private readonly bool _logToFile;
+    private readonly string[] _filterArguments;
 
     public DefaultTestServerConnectionFactory(IStrykerOptions? options = null)
     {
         _outputPath = options?.OutputPath;
         _logToFile = options?.LogOptions.LogToFile ?? false;
+        _filterArguments = TranslateTestCaseFilter(options?.TestCaseFilter);
+    }
+
+    /// <summary>
+    /// Translates the VSTest-style `test-case-filter` option into the trait-exclusion
+    /// arguments the Microsoft.Testing.Platform test host understands, so an excluded
+    /// category never reaches discovery or execution. Only conjunctions of
+    /// `Category!=value` clauses have an exact translation; any other clause shape is
+    /// refused rather than silently ignored, because a filter that stops filtering
+    /// would run tests the campaign's environment cannot support.
+    /// </summary>
+    private static string[] TranslateTestCaseFilter(string? testCaseFilter)
+    {
+        if (string.IsNullOrWhiteSpace(testCaseFilter))
+        {
+            return [];
+        }
+
+        var arguments = new List<string>();
+        foreach (var clause in testCaseFilter.Split('&', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+        {
+            var parts = clause.Split("!=", 2, StringSplitOptions.TrimEntries);
+            if (parts.Length != 2 || parts[0] != "Category" || parts[1].Length == 0)
+            {
+                throw new NotSupportedException(
+                    $"The MTP runner can only translate 'Category!=value' test-case-filter clauses; '{clause}' has no exact equivalent.");
+            }
+
+            arguments.Add("--filter-not-trait");
+            arguments.Add($"Category={parts[1]}");
+        }
+
+        return arguments.ToArray();
     }
 
     public (ITestServerListener Listener, int Port) CreateListener()
@@ -57,7 +91,7 @@ internal sealed class DefaultTestServerConnectionFactory : ITestServerConnection
 
         var cliProcess = Cli.Wrap("dotnet")
             .WithWorkingDirectory(Path.GetDirectoryName(assembly) ?? string.Empty)
-            .WithArguments([assembly, "--server", "--client-port", port.ToString()])
+            .WithArguments([assembly, "--server", "--client-port", port.ToString(), .. _filterArguments])
             .WithEnvironmentVariables(environmentVariables)
             .WithStandardOutputPipe(outputPipe)
             .WithStandardErrorPipe(outputPipe)
