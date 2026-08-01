@@ -137,13 +137,27 @@ public sealed class TestingPlatformClient : ITestingPlatformClient
                 return discoveryListener;
             }, @checked);
 
-    public async Task<ResponseListener> RunTestsAsync(Guid requestId, Func<TestNodeUpdate[], Task> action, TestNode[]? testNodes = null)
+    public async Task<ResponseListener> RunTestsAsync(Guid requestId, Func<TestNodeUpdate[], Task> action, TestNode[]? testNodes = null, TimeSpan? runTimeout = null)
         => await CheckedInvokeAsync(async () =>
         {
-            using CancellationTokenSource cancellationTokenSource = new(TimeSpan.FromMinutes(3));
+            // The RPC call returns when the run completes, so its cancellation window must cover
+            // the whole session budget: a batch can legitimately run longer than any fixed cap,
+            // and cancelling mid-run surfaces as an OperationCanceledException the caller cannot
+            // tell apart from a hung server. The session-level timeout in AssemblyTestServer
+            // stays the authoritative budget; this token only backstops a server that never
+            // answers at all.
+            var rpcWindow = TimeSpan.FromMinutes(3);
+            if (runTimeout is { } budget && budget + TimeSpan.FromSeconds(30) > rpcWindow)
+            {
+                rpcWindow = budget + TimeSpan.FromSeconds(30);
+            }
+            using CancellationTokenSource cancellationTokenSource = new(rpcWindow);
             var runListener = new TestNodeUpdatesResponseListener(requestId, action);
             _targetHandler.RegisterResponseListener(runListener);
-            await JsonRpcClient.InvokeWithParameterObjectAsync("testing/runTests", new RunTestsRequest(RunId: requestId, TestCases: testNodes), cancellationToken: cancellationTokenSource.Token);
+            var requestNodes = testNodes
+                ?.Select(node => new RunRequestTestNode(node.Uid, node.DisplayName))
+                .ToArray();
+            await JsonRpcClient.InvokeWithParameterObjectAsync("testing/runTests", new RunTestsRequest(RunId: requestId, Tests: requestNodes), cancellationToken: cancellationTokenSource.Token);
             return runListener;
         });
 
