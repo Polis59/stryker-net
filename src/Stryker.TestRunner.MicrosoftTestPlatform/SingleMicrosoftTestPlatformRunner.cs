@@ -244,7 +244,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         return DiscoverTestsInternalAsync(assembly);
     }
 
-    public Task<ITestRunResult> InitialTestAsync(IProjectAndTests project)
+    public virtual Task<ITestRunResult> InitialTestAsync(IProjectAndTests project)
     {
         var assemblies = project.GetTestAssemblies();
         return RunAllTestsAsync(assemblies, mutantId: -1, mutants: null, update: null);
