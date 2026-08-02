@@ -1,6 +1,7 @@
 using Moq;
 using Shouldly;
 using Stryker.Abstractions;
+using Stryker.Abstractions.Options;
 using Stryker.Abstractions.Testing;
 using Stryker.TestRunner.Tests;
 
@@ -35,6 +36,23 @@ public class MutationBatchPlannerTests
 
         MutationBatchPlanner.RequiresBroadSessionLimit([narrow]).ShouldBeFalse();
         MutationBatchPlanner.RequiresBroadSessionLimit([narrow, second]).ShouldBeFalse();
+    }
+
+    [TestMethod]
+    public void PackedGroupsHaveBoundedMutantCounts()
+    {
+        var options = new Mock<IStrykerOptions>();
+        options.SetupGet(candidate => candidate.OptimizationMode)
+            .Returns(OptimizationModes.CoverageBasedTest);
+        var mutants = Enumerable.Range(0, 100)
+            .Select(index => CreateMutant(new TestIdentifierList($"test-{index}")))
+            .ToList();
+
+        var groups = MutationBatchPlanner.Build(options.Object, mutants).ToList();
+
+        groups.Sum(group => group.Count).ShouldBe(mutants.Count);
+        groups.Max(group => group.Count).ShouldBe(16);
+        groups.ShouldAllBe(group => group.Count <= 16);
     }
 
     private static IMutant CreateMutant(

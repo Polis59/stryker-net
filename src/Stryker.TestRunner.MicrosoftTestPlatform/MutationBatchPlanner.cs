@@ -19,6 +19,7 @@ public static class MutationBatchPlanner
     /// for the whole session and the host keeps its normal parallel execution.
     /// </summary>
     private const int MaximumSerialSessionTests = 256;
+    private const int MaximumMutantsPerPackedSession = 16;
 
     /// <summary>
     /// Returns whether a planned group should use the broad-session concurrency gate.
@@ -87,6 +88,14 @@ public static class MutationBatchPlanner
 
             for (var index = 0; index < remaining.Count; index++)
             {
+                // An inconclusive packed request retries unresolved mutants one at a
+                // time. Bound the group so one scheduler item cannot hide an
+                // arbitrarily long serial retry tail from the worker pool.
+                if (group.Count >= MaximumMutantsPerPackedSession)
+                {
+                    break;
+                }
+
                 var candidate = remaining[index];
 
                 // Candidates are ordered by ascending set size, so the first one

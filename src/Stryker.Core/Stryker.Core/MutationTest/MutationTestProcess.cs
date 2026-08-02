@@ -85,6 +85,18 @@ public class MutationTestProcess : IMutationTestProcess
     private async Task TestMutantsAsync(IEnumerable<IMutant> mutantsToTest)
     {
         var mutantGroups = BuildMutantGroupsForTest(mutantsToTest.ToList()).ToList();
+        var broadGroupCount = mutantGroups.Count(
+            TestRunner.MicrosoftTestPlatform.MutationBatchPlanner.RequiresBroadSessionLimit);
+        var packedGroups = mutantGroups.Where(group => group.Count > 1).ToList();
+        _logger.LogInformation(
+            "Mutation execution plan: {MutantCount} mutants in {GroupCount} groups; " +
+            "{BroadGroupCount} broad singletons, {PackedGroupCount} packed groups, " +
+            "largest packed group {LargestPackedGroupCount}",
+            mutantGroups.Sum(group => group.Count),
+            mutantGroups.Count,
+            broadGroupCount,
+            packedGroups.Count,
+            packedGroups.Count == 0 ? 0 : packedGroups.Max(group => group.Count));
 
         await MutationWorkLaneScheduler.RunAsync(
             mutantGroups,
