@@ -84,25 +84,14 @@ public class MutationTestProcess : IMutationTestProcess
 
     private async Task TestMutantsAsync(IEnumerable<IMutant> mutantsToTest)
     {
-        var mutantGroups = BuildMutantGroupsForTest(mutantsToTest.ToList());
+        var mutantGroups = BuildMutantGroupsForTest(mutantsToTest.ToList()).ToList();
 
-        var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = _options.Concurrency };
-        var broadSessionLimit = Math.Max(1, _options.Concurrency / 2);
-        using var broadSessionSlots = new SemaphoreSlim(broadSessionLimit, broadSessionLimit);
-
-        await Parallel.ForEachAsync(mutantGroups, parallelOptions, async (mutants, cancellationToken) =>
-        {
-            var limitsBroadSessions = TestRunner.MicrosoftTestPlatform.MutationBatchPlanner
-                .RequiresBroadSessionLimit(mutants);
-            var acquiredBroadSessionSlot = false;
-            try
+        await MutationWorkLaneScheduler.RunAsync(
+            mutantGroups,
+            TestRunner.MicrosoftTestPlatform.MutationBatchPlanner.RequiresBroadSessionLimit,
+            _options.Concurrency,
+            async (mutants, _) =>
             {
-                if (limitsBroadSessions)
-                {
-                    await broadSessionSlots.WaitAsync(cancellationToken).ConfigureAwait(false);
-                    acquiredBroadSessionSlot = true;
-                }
-
                 var reportedMutants = new HashSet<IMutant>();
 
                 await _mutationTestExecutor.TestAsync(Input.SourceProjectInfo, mutants,
@@ -111,15 +100,7 @@ public class MutationTestProcess : IMutationTestProcess
                         TestUpdateHandler(testedMutants, tests, ranTests, outTests, reportedMutants)).ConfigureAwait(false);
 
                 OnMutantsTested(mutants, reportedMutants);
-            }
-            finally
-            {
-                if (acquiredBroadSessionSlot)
-                {
-                    broadSessionSlots.Release();
-                }
-            }
-        }).ConfigureAwait(false);
+            }).ConfigureAwait(false);
     }
 
     private bool TestUpdateHandler(IEnumerable<IMutant> testedMutants, ITestIdentifiers failedTests, ITestIdentifiers ranTests,
@@ -200,4 +181,60 @@ public class MutationTestProcess : IMutationTestProcess
 
     public void GetCoverage() => _coverageAnalyser.DetermineTestCoverage(_options, Input.SourceProjectInfo,
         _mutationTestExecutor.TestRunner, _projectContents.Mutants, Input.InitialTestRun.Result.FailingTests);
+}
+
+/// <summary>
+/// Runs broad and ordinary mutation work in independent producer lanes while
+/// sharing one exact worker budget. A broad item waiting for its lane cannot
+/// occupy an ordinary producer iteration, which prevents the nested-semaphore
+/// starvation caused by one mixed <see cref="Parallel.ForEachAsync{TSource}(IEnumerable{TSource}, ParallelOptions, Func{TSource, CancellationToken, ValueTask})"/>
+/// queue.
+/// </summary>
+internal static class MutationWorkLaneScheduler
+{
+    internal static async Task RunAsync<T>(
+        IReadOnlyCollection<T> work,
+        Func<T, bool> isBroad,
+        int concurrency,
+        Func<T, CancellationToken, Task> execute,
+        CancellationToken cancellationToken = default)
+    {
+        var workerCount = Math.Max(1, concurrency);
+        var broadWorkerCount = Math.Max(1, workerCount / 2);
+        var broad = work.Where(isBroad).ToList();
+        var ordinary = work.Where(item => !isBroad(item)).ToList();
+        using var workerSlots = new SemaphoreSlim(workerCount, workerCount);
+
+        async ValueTask ExecuteAsync(T item, CancellationToken token)
+        {
+            await workerSlots.WaitAsync(token).ConfigureAwait(false);
+            try
+            {
+                await execute(item, token).ConfigureAwait(false);
+            }
+            finally
+            {
+                workerSlots.Release();
+            }
+        }
+
+        var broadTask = Parallel.ForEachAsync(
+            broad,
+            new ParallelOptions
+            {
+                MaxDegreeOfParallelism = broadWorkerCount,
+                CancellationToken = cancellationToken,
+            },
+            ExecuteAsync);
+        var ordinaryTask = Parallel.ForEachAsync(
+            ordinary,
+            new ParallelOptions
+            {
+                MaxDegreeOfParallelism = workerCount,
+                CancellationToken = cancellationToken,
+            },
+            ExecuteAsync);
+
+        await Task.WhenAll(broadTask, ordinaryTask).ConfigureAwait(false);
+    }
 }
