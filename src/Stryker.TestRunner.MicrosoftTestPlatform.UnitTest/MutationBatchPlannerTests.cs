@@ -10,31 +10,31 @@ namespace Stryker.TestRunner.MicrosoftTestPlatform.UnitTest;
 public class MutationBatchPlannerTests
 {
     [TestMethod]
-    public void BroadOrdinarySingletonConsumesTwoWorkerSlots()
+    public void BroadOrdinarySingletonUsesBroadSessionLimit()
     {
         var mutant = CreateMutant(TestIdentifierList.EveryTest());
 
-        MutationBatchPlanner.GetRequiredWorkerSlots([mutant], 12).ShouldBe(2);
+        MutationBatchPlanner.RequiresBroadSessionLimit([mutant]).ShouldBeTrue();
     }
 
     [TestMethod]
-    public void ProcessIsolatedSingletonConsumesOneWorkerSlot()
+    public void ProcessIsolatedSingletonDoesNotUseBroadSessionLimit()
     {
         var mutant = CreateMutant(
             TestIdentifierList.EveryTest(),
             mustBeTestedInIsolation: true);
 
-        MutationBatchPlanner.GetRequiredWorkerSlots([mutant], 12).ShouldBe(1);
+        MutationBatchPlanner.RequiresBroadSessionLimit([mutant]).ShouldBeFalse();
     }
 
     [TestMethod]
-    public void NarrowOrPackedWorkConsumesOneWorkerSlot()
+    public void NarrowOrPackedWorkDoesNotUseBroadSessionLimit()
     {
         var narrow = CreateMutant(new TestIdentifierList("test-1"));
         var second = CreateMutant(new TestIdentifierList("test-2"));
 
-        MutationBatchPlanner.GetRequiredWorkerSlots([narrow], 12).ShouldBe(1);
-        MutationBatchPlanner.GetRequiredWorkerSlots([narrow, second], 12).ShouldBe(1);
+        MutationBatchPlanner.RequiresBroadSessionLimit([narrow]).ShouldBeFalse();
+        MutationBatchPlanner.RequiresBroadSessionLimit([narrow, second]).ShouldBeFalse();
     }
 
     private static IMutant CreateMutant(

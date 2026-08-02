@@ -21,26 +21,18 @@ public static class MutationBatchPlanner
     private const int MaximumSerialSessionTests = 256;
 
     /// <summary>
-    /// Returns the number of campaign worker slots a planned group should consume.
+    /// Returns whether a planned group should use the broad-session concurrency gate.
     /// Broad ordinary single-mutant sessions retain xUnit's internal parallelism;
     /// allowing one such host per reported processor oversubscribes the machine and
-    /// reduces throughput. Two slots cap those sessions at half the runner pool while
-    /// narrow, packed, and process-isolated work can still use every worker.
+    /// reduces throughput. The dedicated gate caps those sessions at half the runner
+    /// pool atomically while narrow, packed, and process-isolated work can still use
+    /// every worker.
     /// </summary>
-    public static int GetRequiredWorkerSlots(
-        IReadOnlyList<IMutant> group,
-        int availableWorkerSlots)
-    {
-        if (group.Count != 1 ||
-            RequiresProcessIsolation(group[0]) ||
-            !group[0].AssessingTests.IsEveryTest &&
-            group[0].AssessingTests.Count <= MaximumSerialSessionTests)
-        {
-            return 1;
-        }
-
-        return Math.Min(2, Math.Max(availableWorkerSlots, 1));
-    }
+    public static bool RequiresBroadSessionLimit(IReadOnlyList<IMutant> group) =>
+        group.Count == 1 &&
+        !RequiresProcessIsolation(group[0]) &&
+        (group[0].AssessingTests.IsEveryTest ||
+         group[0].AssessingTests.Count > MaximumSerialSessionTests);
 
     public static IEnumerable<List<IMutant>> Build(
         IStrykerOptions options,

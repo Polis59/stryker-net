@@ -87,19 +87,20 @@ public class MutationTestProcess : IMutationTestProcess
         var mutantGroups = BuildMutantGroupsForTest(mutantsToTest.ToList());
 
         var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = _options.Concurrency };
-        using var workerSlots = new SemaphoreSlim(_options.Concurrency, _options.Concurrency);
+        var broadSessionLimit = Math.Max(1, _options.Concurrency / 2);
+        using var broadSessionSlots = new SemaphoreSlim(broadSessionLimit, broadSessionLimit);
 
         await Parallel.ForEachAsync(mutantGroups, parallelOptions, async (mutants, cancellationToken) =>
         {
-            var requiredSlots = TestRunner.MicrosoftTestPlatform.MutationBatchPlanner
-                .GetRequiredWorkerSlots(mutants, _options.Concurrency);
-            var acquiredSlots = 0;
+            var limitsBroadSessions = TestRunner.MicrosoftTestPlatform.MutationBatchPlanner
+                .RequiresBroadSessionLimit(mutants);
+            var acquiredBroadSessionSlot = false;
             try
             {
-                while (acquiredSlots < requiredSlots)
+                if (limitsBroadSessions)
                 {
-                    await workerSlots.WaitAsync(cancellationToken).ConfigureAwait(false);
-                    acquiredSlots++;
+                    await broadSessionSlots.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    acquiredBroadSessionSlot = true;
                 }
 
                 var reportedMutants = new HashSet<IMutant>();
@@ -113,9 +114,9 @@ public class MutationTestProcess : IMutationTestProcess
             }
             finally
             {
-                if (acquiredSlots > 0)
+                if (acquiredBroadSessionSlot)
                 {
-                    workerSlots.Release(acquiredSlots);
+                    broadSessionSlots.Release();
                 }
             }
         }).ConfigureAwait(false);
