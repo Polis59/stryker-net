@@ -239,7 +239,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             : "The injected mutation activation helper did not acknowledge the current MTP request.";
     }
 
-    public Task<bool> DiscoverTestsAsync(string assembly)
+    public virtual Task<bool> DiscoverTestsAsync(string assembly)
     {
         return DiscoverTestsInternalAsync(assembly);
     }

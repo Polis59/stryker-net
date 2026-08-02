@@ -33,6 +33,8 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
     private readonly Dictionary<string, MtpTestDescription> _testDescriptions = new();
     private readonly object _discoveryLock = new();
     private readonly object _coverageCacheLock = new();
+    private readonly ConcurrentDictionary<string, Lazy<Task<bool>>> _discoveryCache =
+        new(StringComparer.Ordinal);
     private readonly Dictionary<
         CoverageConfidence,
         IReadOnlyList<ICoverageRunResult>> _perTestCoverageCache = [];
@@ -89,7 +91,17 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
             return false;
         }
 
-        return await RunThisAsync(runner => runner.DiscoverTestsAsync(assembly)).ConfigureAwait(false);
+        var path = Path.GetFullPath(assembly);
+        var candidate = new Lazy<Task<bool>>(
+            () => RunThisAsync(runner => runner.DiscoverTestsAsync(path)),
+            LazyThreadSafetyMode.ExecutionAndPublication);
+        var discovery = _discoveryCache.GetOrAdd(path, candidate);
+        if (!ReferenceEquals(discovery, candidate))
+        {
+            _logger.LogInformation("Reusing test discovery for {TestAssembly}", path);
+        }
+
+        return await discovery.Value.ConfigureAwait(false);
     }
 
     public ITestSet GetTests(IProjectAndTests project) => _testSet;

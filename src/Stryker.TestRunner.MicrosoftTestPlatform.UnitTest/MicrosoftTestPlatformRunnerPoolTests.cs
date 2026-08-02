@@ -15,6 +15,46 @@ namespace Stryker.TestRunner.MicrosoftTestPlatform.UnitTest;
 public class MicrosoftTestPlatformRunnerPoolTests : TestBase
 {
     [TestMethod]
+    public async Task DiscoverTestsAsync_ReusesOneRunForSharedTestAssembly()
+    {
+        var discoveryStarted = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseDiscovery = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var runner = CreateRunner();
+        var calls = 0;
+        string assembly = Path.GetTempFileName();
+        try
+        {
+            runner
+                .Setup(candidate => candidate.DiscoverTestsAsync(assembly))
+                .Callback(() =>
+                {
+                    Interlocked.Increment(ref calls);
+                    discoveryStarted.TrySetResult();
+                })
+                .Returns(releaseDiscovery.Task);
+
+            using var pool = CreatePool(runner.Object);
+            var first = pool.DiscoverTestsAsync(assembly);
+            var second = pool.DiscoverTestsAsync(assembly);
+
+            await discoveryStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            calls.ShouldBe(1);
+
+            releaseDiscovery.SetResult(true);
+
+            (await first).ShouldBeTrue();
+            (await second).ShouldBeTrue();
+            calls.ShouldBe(1);
+        }
+        finally
+        {
+            File.Delete(assembly);
+        }
+    }
+
+    [TestMethod]
     public async Task InitialTestAsync_ReusesOneRunForSharedTestAssemblies()
     {
         var firstRunStarted = new TaskCompletionSource(
