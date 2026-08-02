@@ -12,14 +12,17 @@ namespace Stryker.Core.UnitTest.MutationTest;
 public class MutationWorkLaneSchedulerTests
 {
     [TestMethod]
-    public async Task BroadBacklogDoesNotStarveOrdinaryWorkAsync()
+    public async Task LanesShareCapacityFairlyAndOrdinaryBorrowsAfterBroadDrainsAsync()
     {
         const int concurrency = 4;
-        var work = Enumerable.Range(0, 10).ToArray();
-        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var ordinaryStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var work = Enumerable.Range(0, 16).ToArray();
+        var releaseBroad = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseOrdinary = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var balancedLanesStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ordinaryExpanded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var active = 0;
         var activeBroad = 0;
+        var activeOrdinary = 0;
         var maximumActive = 0;
         var maximumActiveBroad = 0;
 
@@ -35,15 +38,28 @@ public class MutationWorkLaneSchedulerTests
                 {
                     var currentBroad = Interlocked.Increment(ref activeBroad);
                     UpdateMaximum(ref maximumActiveBroad, currentBroad);
+                    if (currentBroad >= concurrency / 2 && Volatile.Read(ref activeOrdinary) >= concurrency / 2)
+                    {
+                        balancedLanesStarted.TrySetResult();
+                    }
                 }
                 else
                 {
-                    ordinaryStarted.TrySetResult();
+                    var currentOrdinary = Interlocked.Increment(ref activeOrdinary);
+                    if (currentOrdinary >= concurrency)
+                    {
+                        ordinaryExpanded.TrySetResult();
+                    }
+
+                    if (currentOrdinary >= concurrency / 2 && Volatile.Read(ref activeBroad) >= concurrency / 2)
+                    {
+                        balancedLanesStarted.TrySetResult();
+                    }
                 }
 
                 try
                 {
-                    await release.Task.ConfigureAwait(false);
+                    await (item < 8 ? releaseBroad.Task : releaseOrdinary.Task).ConfigureAwait(false);
                 }
                 finally
                 {
@@ -51,17 +67,26 @@ public class MutationWorkLaneSchedulerTests
                     {
                         Interlocked.Decrement(ref activeBroad);
                     }
+                    else
+                    {
+                        Interlocked.Decrement(ref activeOrdinary);
+                    }
 
                     Interlocked.Decrement(ref active);
                 }
             });
 
-        var started = await Task.WhenAny(ordinaryStarted.Task, Task.Delay(TimeSpan.FromSeconds(5)));
-        started.ShouldBe(ordinaryStarted.Task);
+        var started = await Task.WhenAny(balancedLanesStarted.Task, Task.Delay(TimeSpan.FromSeconds(5)));
+        started.ShouldBe(balancedLanesStarted.Task);
         maximumActiveBroad.ShouldBeLessThanOrEqualTo(concurrency / 2);
         maximumActive.ShouldBeLessThanOrEqualTo(concurrency);
 
-        release.TrySetResult();
+        releaseBroad.TrySetResult();
+        var expanded = await Task.WhenAny(ordinaryExpanded.Task, Task.Delay(TimeSpan.FromSeconds(5)));
+        expanded.ShouldBe(ordinaryExpanded.Task);
+        maximumActive.ShouldBeLessThanOrEqualTo(concurrency);
+
+        releaseOrdinary.TrySetResult();
         await run;
     }
 

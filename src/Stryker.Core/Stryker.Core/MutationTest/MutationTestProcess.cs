@@ -200,21 +200,37 @@ internal static class MutationWorkLaneScheduler
         CancellationToken cancellationToken = default)
     {
         var workerCount = Math.Max(1, concurrency);
+        if (workerCount == 1)
+        {
+            await Parallel.ForEachAsync(
+                work,
+                new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = 1,
+                    CancellationToken = cancellationToken,
+                },
+                async (item, token) => await execute(item, token).ConfigureAwait(false)).ConfigureAwait(false);
+            return;
+        }
+
         var broadWorkerCount = Math.Max(1, workerCount / 2);
         var broad = work.Where(isBroad).ToList();
         var ordinary = work.Where(item => !isBroad(item)).ToList();
-        using var workerSlots = new SemaphoreSlim(workerCount, workerCount);
+        var ordinaryWorkerCount = broad.Count == 0
+            ? workerCount
+            : workerCount - broadWorkerCount;
+        using var ordinarySlots = new SemaphoreSlim(ordinaryWorkerCount, workerCount);
 
-        async ValueTask ExecuteAsync(T item, CancellationToken token)
+        async ValueTask ExecuteOrdinaryAsync(T item, CancellationToken token)
         {
-            await workerSlots.WaitAsync(token).ConfigureAwait(false);
+            await ordinarySlots.WaitAsync(token).ConfigureAwait(false);
             try
             {
                 await execute(item, token).ConfigureAwait(false);
             }
             finally
             {
-                workerSlots.Release();
+                ordinarySlots.Release();
             }
         }
 
@@ -225,7 +241,7 @@ internal static class MutationWorkLaneScheduler
                 MaxDegreeOfParallelism = broadWorkerCount,
                 CancellationToken = cancellationToken,
             },
-            ExecuteAsync);
+            async (item, token) => await execute(item, token).ConfigureAwait(false));
         var ordinaryTask = Parallel.ForEachAsync(
             ordinary,
             new ParallelOptions
@@ -233,8 +249,23 @@ internal static class MutationWorkLaneScheduler
                 MaxDegreeOfParallelism = workerCount,
                 CancellationToken = cancellationToken,
             },
-            ExecuteAsync);
+            ExecuteOrdinaryAsync);
 
-        await Task.WhenAll(broadTask, ordinaryTask).ConfigureAwait(false);
+        async Task LendBroadCapacityAsync()
+        {
+            try
+            {
+                await broadTask.ConfigureAwait(false);
+            }
+            finally
+            {
+                if (ordinaryWorkerCount < workerCount)
+                {
+                    ordinarySlots.Release(workerCount - ordinaryWorkerCount);
+                }
+            }
+        }
+
+        await Task.WhenAll(broadTask, ordinaryTask, LendBroadCapacityAsync()).ConfigureAwait(false);
     }
 }
