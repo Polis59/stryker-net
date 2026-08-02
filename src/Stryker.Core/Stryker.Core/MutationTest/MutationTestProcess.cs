@@ -231,7 +231,21 @@ internal static class MutationWorkLaneScheduler
         var ordinaryWorkerCount = broad.Count == 0
             ? workerCount
             : workerCount - broadWorkerCount;
+        using var broadSlots = new SemaphoreSlim(broadWorkerCount, workerCount);
         using var ordinarySlots = new SemaphoreSlim(ordinaryWorkerCount, workerCount);
+
+        async ValueTask ExecuteBroadAsync(T item, CancellationToken token)
+        {
+            await broadSlots.WaitAsync(token).ConfigureAwait(false);
+            try
+            {
+                await execute(item, token).ConfigureAwait(false);
+            }
+            finally
+            {
+                broadSlots.Release();
+            }
+        }
 
         async ValueTask ExecuteOrdinaryAsync(T item, CancellationToken token)
         {
@@ -250,10 +264,10 @@ internal static class MutationWorkLaneScheduler
             broad,
             new ParallelOptions
             {
-                MaxDegreeOfParallelism = broadWorkerCount,
+                MaxDegreeOfParallelism = workerCount,
                 CancellationToken = cancellationToken,
             },
-            async (item, token) => await execute(item, token).ConfigureAwait(false));
+            ExecuteBroadAsync);
         var ordinaryTask = Parallel.ForEachAsync(
             ordinary,
             new ParallelOptions
@@ -278,6 +292,25 @@ internal static class MutationWorkLaneScheduler
             }
         }
 
-        await Task.WhenAll(broadTask, ordinaryTask, LendBroadCapacityAsync()).ConfigureAwait(false);
+        async Task LendOrdinaryCapacityAsync()
+        {
+            try
+            {
+                await ordinaryTask.ConfigureAwait(false);
+            }
+            finally
+            {
+                if (broadWorkerCount < workerCount)
+                {
+                    broadSlots.Release(workerCount - broadWorkerCount);
+                }
+            }
+        }
+
+        await Task.WhenAll(
+            broadTask,
+            ordinaryTask,
+            LendBroadCapacityAsync(),
+            LendOrdinaryCapacityAsync()).ConfigureAwait(false);
     }
 }
