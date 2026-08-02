@@ -86,17 +86,37 @@ public class MutationTestProcess : IMutationTestProcess
         var mutantGroups = BuildMutantGroupsForTest(mutantsToTest.ToList());
 
         var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = _options.Concurrency };
+        using var workerSlots = new SemaphoreSlim(_options.Concurrency, _options.Concurrency);
 
         await Parallel.ForEachAsync(mutantGroups, parallelOptions, async (mutants, cancellationToken) =>
         {
-            var reportedMutants = new HashSet<IMutant>();
+            var requiredSlots = TestRunner.MicrosoftTestPlatform.MutationBatchPlanner
+                .GetRequiredWorkerSlots(mutants, _options.Concurrency);
+            var acquiredSlots = 0;
+            try
+            {
+                while (acquiredSlots < requiredSlots)
+                {
+                    await workerSlots.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    acquiredSlots++;
+                }
 
-            await _mutationTestExecutor.TestAsync(Input.SourceProjectInfo, mutants,
-                Input.InitialTestRun.TimeoutValueCalculator,
-                (testedMutants, tests, ranTests, outTests) =>
-                    TestUpdateHandler(testedMutants, tests, ranTests, outTests, reportedMutants)).ConfigureAwait(false);
+                var reportedMutants = new HashSet<IMutant>();
 
-            OnMutantsTested(mutants, reportedMutants);
+                await _mutationTestExecutor.TestAsync(Input.SourceProjectInfo, mutants,
+                    Input.InitialTestRun.TimeoutValueCalculator,
+                    (testedMutants, tests, ranTests, outTests) =>
+                        TestUpdateHandler(testedMutants, tests, ranTests, outTests, reportedMutants)).ConfigureAwait(false);
+
+                OnMutantsTested(mutants, reportedMutants);
+            }
+            finally
+            {
+                if (acquiredSlots > 0)
+                {
+                    workerSlots.Release(acquiredSlots);
+                }
+            }
         }).ConfigureAwait(false);
     }
 

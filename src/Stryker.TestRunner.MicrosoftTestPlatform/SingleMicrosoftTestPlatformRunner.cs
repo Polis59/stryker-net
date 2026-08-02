@@ -1048,7 +1048,12 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             }
 
             var (testResults, timedOut) = await server
-                .RunTestsAsync(testsToRun.ToArray(), timeout, bailPredicate, stallDetection: false)
+                // A dedicated process has the same streamed progress contract as a
+                // warm host. Healthy cold runs publish their first update well inside
+                // the 30-second startup window and continue inside the 10-second active
+                // window; an isolation mutant that exceeds either window is genuinely
+                // stalled and must not consume the entire broad session budget.
+                .RunTestsAsync(testsToRun.ToArray(), timeout, bailPredicate, stallDetection: true)
                 .ConfigureAwait(false);
             var result = BuildTestRunResult(
                 NormalizeToDiscoveredCases(testResults, discoveredTests),
