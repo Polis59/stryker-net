@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO.Abstractions;
 using System.Linq;
 using System.Threading;
@@ -88,22 +89,38 @@ public class MutationTestProcess : IMutationTestProcess
         var broadGroupCount = mutantGroups.Count(
             TestRunner.MicrosoftTestPlatform.MutationBatchPlanner.RequiresBroadSessionLimit);
         var packedGroups = mutantGroups.Where(group => group.Count > 1).ToList();
+        var totalMutantCount = mutantGroups.Sum(group => group.Count);
+        var projectFilePath = Input.SourceProjectInfo.AnalyzerResult.ProjectFilePath;
+        var indexedGroups = mutantGroups
+            .Select((mutants, index) => (Index: index + 1, Mutants: mutants))
+            .ToList();
+        var campaignTimer = Stopwatch.StartNew();
+        var completedGroupCount = 0;
+        var completedMutantCount = 0;
         _logger.LogInformation(
             "Mutation execution plan: {MutantCount} mutants in {GroupCount} groups; " +
             "{BroadGroupCount} broad singletons, {PackedGroupCount} packed groups, " +
             "largest packed group {LargestPackedGroupCount}",
-            mutantGroups.Sum(group => group.Count),
+            totalMutantCount,
             mutantGroups.Count,
             broadGroupCount,
             packedGroups.Count,
             packedGroups.Count == 0 ? 0 : packedGroups.Max(group => group.Count));
 
         await MutationWorkLaneScheduler.RunAsync(
-            mutantGroups,
-            TestRunner.MicrosoftTestPlatform.MutationBatchPlanner.RequiresBroadSessionLimit,
+            indexedGroups,
+            group => TestRunner.MicrosoftTestPlatform.MutationBatchPlanner.RequiresBroadSessionLimit(group.Mutants),
             _options.Concurrency,
-            async (mutants, _) =>
+            async (group, _) =>
             {
+                var mutants = group.Mutants;
+                var groupTimer = Stopwatch.StartNew();
+                _logger.LogInformation(
+                    "Mutation group started: project {ProjectFilePath}, group {GroupIndex}/{TotalGroupCount}, mutants {GroupMutantCount}",
+                    projectFilePath,
+                    group.Index,
+                    indexedGroups.Count,
+                    mutants.Count);
                 var reportedMutants = new HashSet<IMutant>();
 
                 await _mutationTestExecutor.TestAsync(Input.SourceProjectInfo, mutants,
@@ -112,6 +129,22 @@ public class MutationTestProcess : IMutationTestProcess
                         TestUpdateHandler(testedMutants, tests, ranTests, outTests, reportedMutants)).ConfigureAwait(false);
 
                 OnMutantsTested(mutants, reportedMutants);
+                var groupsCompleted = Interlocked.Increment(ref completedGroupCount);
+                var mutantsCompleted = Interlocked.Add(ref completedMutantCount, mutants.Count);
+                _logger.LogInformation(
+                    "Mutation group completed: project {ProjectFilePath}, group {GroupIndex}/{TotalGroupCount}, " +
+                    "mutants {GroupMutantCount}, completed groups {CompletedGroupCount}/{TotalGroupCount}, " +
+                    "completed mutants {CompletedMutantCount}/{TotalMutantCount}, duration {GroupDurationMs} ms, elapsed {ElapsedMs} ms",
+                    projectFilePath,
+                    group.Index,
+                    indexedGroups.Count,
+                    mutants.Count,
+                    groupsCompleted,
+                    indexedGroups.Count,
+                    mutantsCompleted,
+                    totalMutantCount,
+                    groupTimer.ElapsedMilliseconds,
+                    campaignTimer.ElapsedMilliseconds);
             }).ConfigureAwait(false);
     }
 

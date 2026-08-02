@@ -1,3 +1,5 @@
+#pragma warning disable CS8600, CS8601, CS8602, CS8603, CS8618, CS8625
+
 namespace Stryker
 {
     /// <summary>
@@ -22,13 +24,13 @@ namespace Stryker
         // Initialized to avoid nullable warnings/errors
         private static string _cachedMutantFilePath = string.Empty;
         private static bool _mutantFilePathCached;
+        private static bool _fileMutantValueCached;
 
         // Memory-mapped view of the mutant-id file used by the MTP runner. The runner writes the active
         // mutant id (a 4-byte int) to the file between runs; reading it through a memory-mapped view is a
-        // plain memory access (no syscall), so it is cheap enough for the IsActive hot path while still
-        // always reflecting the latest value the runner wrote. The test host process is reused across
-        // mutant runs and has no per-run reset hook, so reading every call (rather than caching) is what
-        // keeps this correct: any cached or event-based scheme would race the start of the next run.
+        // plain memory access (no syscall). A cooperating test host refreshes ActiveMutant once before
+        // each run request, allowing IsActive to avoid even that accessor read at every mutation point.
+        // Hosts without the refresh hook retain the dynamic read on every call so activation cannot go stale.
         // _mutantMmf / _mutantAccessor are typed as object and initialized to a non-null sentinel only to
         // root them (and avoid nullable warnings); the accessor is cast back to its real type when read.
         private static object _mutantMmf = new System.Object();
@@ -301,6 +303,25 @@ namespace Stryker
         public static void ResetActiveMutant()
         {
             ActiveMutant = ActiveMutantNotInitValue;
+            _fileMutantValueCached = false;
+        }
+
+        /// <summary>
+        /// Refreshes the whole-session mutant selected by the MTP runner. Test-framework hooks call this
+        /// once before each run request so mutation points can compare against a process-local integer.
+        /// </summary>
+        public static void RefreshActiveMutantFromFile()
+        {
+            int fileMutantId;
+            if (TryReadMutantFromFile(out fileMutantId))
+            {
+                ActiveMutant = fileMutantId;
+                _fileMutantValueCached = true;
+            }
+            else
+            {
+                _fileMutantValueCached = false;
+            }
         }
 
         /// <summary>
@@ -610,6 +631,7 @@ namespace Stryker
                 System.Environment.SetEnvironmentVariable(environmentVariableName, mutantId.ToString());
             }
             ActiveMutant = ActiveMutantNotInitValue;
+            _fileMutantValueCached = false;
         }
 
         private static bool TryReadMutantFromFile(out int mutantId)
@@ -807,19 +829,20 @@ namespace Stryker
                 return id == parallelMutant;
             }
 
-            // File-based mutant control (used by the MTP runner's persistent test hosts):
-            // the runner writes the whole-session mutant id before each run request, and the
-            // memory-mapped read below is a plain memory access, cheap enough for this hot
-            // path while always reflecting the latest value the runner wrote.
+            // File-based mutant control (used by the MTP runner's persistent test hosts).
+            // A cooperating host refreshes the value once at request start. Without that hook,
+            // retain the per-call read so older integrations continue to observe runner updates.
             if (!_mutantFilePathCached || !string.IsNullOrEmpty(_cachedMutantFilePath))
             {
-                int fileMutantId;
-                if (TryReadMutantFromFile(out fileMutantId))
+                if (!_fileMutantValueCached)
                 {
-                    return id == fileMutantId;
+                    int fileMutantId;
+                    if (TryReadMutantFromFile(out fileMutantId))
+                    {
+                        return id == fileMutantId;
+                    }
                 }
-
-                if (_mutantFilePathCached && !string.IsNullOrEmpty(_cachedMutantFilePath))
+                else
                 {
                     return id == ActiveMutant;
                 }
