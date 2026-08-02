@@ -55,6 +55,60 @@ public class MutationBatchPlannerTests
         groups.ShouldAllBe(group => group.Count <= 16);
     }
 
+    [TestMethod]
+    public void DisjointIsolationMutantsShareOneFreshProcessGroup()
+    {
+        var options = new Mock<IStrykerOptions>();
+        options.SetupGet(candidate => candidate.OptimizationMode)
+            .Returns(OptimizationModes.CoverageBasedTest);
+        var mutants = Enumerable.Range(0, 16)
+            .Select(index => CreateMutant(
+                new TestIdentifierList($"test-{index}"),
+                mustBeTestedInIsolation: true))
+            .ToList();
+
+        var groups = MutationBatchPlanner.Build(options.Object, mutants).ToList();
+
+        groups.Count.ShouldBe(1);
+        groups[0].ShouldBe(mutants);
+    }
+
+    [TestMethod]
+    public void IsolationMutantsNeverShareAGroupWithOrdinaryMutants()
+    {
+        var options = new Mock<IStrykerOptions>();
+        options.SetupGet(candidate => candidate.OptimizationMode)
+            .Returns(OptimizationModes.CoverageBasedTest);
+        var isolated = CreateMutant(
+            new TestIdentifierList("isolated-test"),
+            mustBeTestedInIsolation: true);
+        var ordinary = CreateMutant(new TestIdentifierList("ordinary-test"));
+
+        var groups = MutationBatchPlanner.Build(options.Object, [isolated, ordinary]).ToList();
+
+        groups.Count.ShouldBe(2);
+        groups.ShouldContain(group => group.Count == 1 && ReferenceEquals(group[0], isolated));
+        groups.ShouldContain(group => group.Count == 1 && ReferenceEquals(group[0], ordinary));
+    }
+
+    [TestMethod]
+    public void IsolationMutantsWithOverlappingTestsKeepDistinctFreshProcesses()
+    {
+        var options = new Mock<IStrykerOptions>();
+        options.SetupGet(candidate => candidate.OptimizationMode)
+            .Returns(OptimizationModes.CoverageBasedTest);
+        var mutants = Enumerable.Range(0, 2)
+            .Select(_ => CreateMutant(
+                new TestIdentifierList("shared-test"),
+                mustBeTestedInIsolation: true))
+            .ToList();
+
+        var groups = MutationBatchPlanner.Build(options.Object, mutants).ToList();
+
+        groups.Count.ShouldBe(2);
+        groups.ShouldAllBe(group => group.Count == 1);
+    }
+
     private static IMutant CreateMutant(
         ITestIdentifiers assessingTests,
         bool mustBeTestedInIsolation = false)

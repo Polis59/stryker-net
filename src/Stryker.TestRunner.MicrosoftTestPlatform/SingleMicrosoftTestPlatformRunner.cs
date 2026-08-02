@@ -263,14 +263,15 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             throw new ArgumentException("At least one mutant is required.", nameof(mutants));
         }
 
-        // A multi-mutant group of ordinary mutants multiplexes through one parallel
-        // request: the map binds each covering test to its mutant, the injected helper
-        // resolves the binding per test, and the whole disjoint union runs with the
-        // host's normal parallelism under an exact measured budget. A group that the
-        // budget cannot afford leaves its unresolved mutants pending; the executor
-        // retries them one at a time below, where the whole-session truth court's
-        // generous budget rules and only a mutant that exhausts even that earns Timeout.
-        if (mutants.Count > 1 && !mutants.Any(RequiresProcessIsolation))
+        // A multi-mutant group multiplexes through one parallel request: the map binds each
+        // covering test to its mutant, and the injected helper resolves that binding before the
+        // complete test lifecycle. Ordinary groups reuse the warm host. An all-isolation group
+        // pays one fresh process so every static path starts unloaded, while disjoint coverage
+        // prevents one assigned test from initializing another packed mutant's path. A group
+        // that the budget cannot afford leaves unresolved mutants pending for the executor's
+        // one-at-a-time truth court below.
+        var packedIsolation = mutants.Count > 1 && mutants.All(RequiresProcessIsolation);
+        if (mutants.Count > 1 && (packedIsolation || !mutants.Any(RequiresProcessIsolation)))
         {
             var packedAssignments = WriteParallelMutantMap(mutants);
             try
@@ -282,6 +283,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                     update,
                     timeoutCalc,
                     BuildTestUidFilter(mutants),
+                    useFreshProcess: packedIsolation,
                     packedAssignments: packedAssignments).ConfigureAwait(false);
             }
             finally
@@ -1408,7 +1410,18 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                     if (timedOut)
                     {
                         accumulator.HasTimeout = true;
-                        if (useFreshProcess)
+                        if (packedAssignments is not null)
+                        {
+                            // A timed-out packed session must not blanket-stamp its tests:
+                            // completed verdicts stand and unresolved mutants retry alone. A
+                            // warm packed host is wedged and must be discarded; a fresh packed
+                            // host is already disposed by its request boundary.
+                            if (!useFreshProcess)
+                            {
+                                await DiscardServerAsync(assembly).ConfigureAwait(false);
+                            }
+                        }
+                        else if (useFreshProcess)
                         {
                             accumulator.TimedOutTests.AddRange(
                                 testUidFilter is null
@@ -1416,18 +1429,6 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                                     : discoveredTests
                                         .Where(testUidFilter)
                                         .Select(test => test.Uid));
-                        }
-                        else if (packedAssignments is not null)
-                        {
-                            // A timed-out packed session must not blanket-stamp its tests:
-                            // mutants killed by completed failures keep their kills, mutants
-                            // whose full set ran clean keep survival, and everyone with
-                            // incomplete evidence stays pending for an individual retry in
-                            // the whole-session truth court. Stamping every discovered test
-                            // as timed out would instead hand all unresolved mutants a
-                            // Timeout verdict the budget - not the mutant - earned. The
-                            // wedged host is still discarded.
-                            await DiscardServerAsync(assembly).ConfigureAwait(false);
                         }
                         else
                         {

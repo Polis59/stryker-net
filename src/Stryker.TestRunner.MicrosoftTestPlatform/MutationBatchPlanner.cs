@@ -60,13 +60,12 @@ public static class MutationBatchPlanner
                 .Select(mutant => new List<IMutant> { mutant }));
         remaining.RemoveAll(mutant => mutant.AssessingTests.IsEveryTest);
 
-        // Static and early-activation mutants require a distinct reload
-        // boundary. Keeping them out of the greedy ordinary packer prevents
-        // their broad coverage sets from fragmenting reusable-host batches.
-        groups.AddRange(
-            remaining
-                .Where(RequiresProcessIsolation)
-                .Select(mutant => new List<IMutant> { mutant }));
+        // Static and early-activation mutants require a fresh reload boundary, but disjoint
+        // assessing sets may share that one fresh process. The activation map binds each test
+        // to its mutant before its test lifecycle starts; disjoint coverage proves a test for one
+        // mutant cannot initialize another packed mutant's static path. Keep isolation groups
+        // separate from ordinary groups so a warm-host request never absorbs one accidentally.
+        groups.AddRange(PackDisjointMutants(remaining.Where(RequiresProcessIsolation)));
         remaining.RemoveAll(RequiresProcessIsolation);
 
         groups.AddRange(
@@ -75,9 +74,18 @@ public static class MutationBatchPlanner
                 .Select(mutant => new List<IMutant> { mutant }));
         remaining.RemoveAll(mutant => mutant.AssessingTests.Count > MaximumSerialSessionTests);
 
-        remaining = remaining
+        groups.AddRange(PackDisjointMutants(remaining));
+
+        ReportPlan(groups);
+        return groups;
+    }
+
+    private static IEnumerable<List<IMutant>> PackDisjointMutants(IEnumerable<IMutant> candidates)
+    {
+        var remaining = candidates
             .OrderBy(mutant => mutant.AssessingTests.Count)
             .ToList();
+        var groups = new List<List<IMutant>>();
 
         while (remaining.Count > 0)
         {
@@ -120,7 +128,6 @@ public static class MutationBatchPlanner
             groups.Add(group);
         }
 
-        ReportPlan(groups);
         return groups;
     }
 
