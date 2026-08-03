@@ -69,7 +69,13 @@ public class SinceMutantFilter : IMutantFilter
         }
         else
         {
-            filteredMutants = SetNotRunMutantsToIgnored(mutants);
+            // A baseline match already has a terminal result and needs no execution.
+            // Anything still pending did not match baseline evidence and must run; silently
+            // ignoring it would turn a stale or missing baseline into a false green report.
+            filteredMutants = options.WithBaseline
+                ? mutants.Where(mutant =>
+                    mutant.ResultStatusReason != BaselineMutantFilter.ReusedResultReason).ToList()
+                : SetNotRunMutantsToIgnored(mutants);
         }
 
         // If any of the tests have been changed, we want to return all mutants covered by these testfiles.

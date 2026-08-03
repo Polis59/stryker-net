@@ -14,7 +14,23 @@ public class BaselineMutantHelper : IBaselineMutantHelper
     {
         return mutants.Where(x =>
            x.Mutation.OriginalNode.ToString() == baselineMutantSourceCode &&
-           x.Mutation.DisplayName == baselineMutant.MutatorName);
+           x.Mutation.DisplayName == baselineMutant.MutatorName &&
+           x.Mutation.ReplacementNode.ToString() == baselineMutant.Replacement &&
+           HasSameLocation(x, baselineMutant));
+    }
+
+    private static bool HasSameLocation(IMutant mutant, IJsonMutant baselineMutant)
+    {
+        if (baselineMutant.Location?.Start is null || baselineMutant.Location.End is null)
+        {
+            return false;
+        }
+
+        var current = mutant.Mutation.OriginalNode.GetLocation().GetMappedLineSpan();
+        return current.StartLinePosition.Line + 1 == baselineMutant.Location.Start.Line &&
+            current.StartLinePosition.Character + 1 == baselineMutant.Location.Start.Column &&
+            current.EndLinePosition.Line + 1 == baselineMutant.Location.End.Line &&
+            current.EndLinePosition.Character + 1 == baselineMutant.Location.End.Column;
     }
 
     public string GetMutantSourceCode(string source, IJsonMutant baselineMutant)
