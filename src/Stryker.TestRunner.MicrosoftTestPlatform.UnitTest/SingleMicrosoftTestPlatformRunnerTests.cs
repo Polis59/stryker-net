@@ -20,7 +20,7 @@ public class SingleMicrosoftTestPlatformRunnerTests
         while (remaining.Values.Any(tests => tests.Count > 0))
         {
             var wave = SingleMicrosoftTestPlatformRunner.BuildWaveAssignments(
-                remaining.Select(pair => (pair.Key, 0, (IReadOnlyList<string>)pair.Value)),
+                remaining.Select(pair => (pair.Key, (IReadOnlyList<string>)pair.Value)),
                 sliceSize: 2);
             assignments.Add(wave);
             foreach (var (testUid, mutantId) in wave)
@@ -39,7 +39,7 @@ public class SingleMicrosoftTestPlatformRunnerTests
     {
         var states = Enumerable.Range(0, 100)
             .Select(mutantId =>
-                (mutantId, 0, (IReadOnlyList<string>)[$"test-{mutantId}"]));
+                (mutantId, (IReadOnlyList<string>)[$"test-{mutantId}"]));
 
         var assignments = SingleMicrosoftTestPlatformRunner.BuildWaveAssignments(
             states,
@@ -53,7 +53,7 @@ public class SingleMicrosoftTestPlatformRunnerTests
     {
         var states = Enumerable.Range(0, 10)
             .Select(mutantId =>
-                (mutantId, 0, (IReadOnlyList<string>)[$"test-{mutantId}"]));
+                (mutantId, (IReadOnlyList<string>)[$"test-{mutantId}"]));
 
         var assignments = SingleMicrosoftTestPlatformRunner.BuildWaveAssignments(
             states,
@@ -65,31 +65,13 @@ public class SingleMicrosoftTestPlatformRunnerTests
     }
 
     [TestMethod]
-    public void WaveAssignmentsPrioritizeMutantsWithLessExecutedEvidence()
-    {
-        var states = new[]
-        {
-            (MutantId: 1, ExecutedCount: 8, Remaining: (IReadOnlyList<string>)["late-survivor"]),
-            (MutantId: 2, ExecutedCount: 0, Remaining: (IReadOnlyList<string>)["untested"]),
-        };
-
-        var assignments = SingleMicrosoftTestPlatformRunner.BuildWaveAssignments(
-            states,
-            sliceSize: 1,
-            activationFamilySelector: null,
-            maximumAssignments: 1);
-
-        assignments.ShouldBe(new Dictionary<string, int> { ["untested"] = 2 });
-    }
-
-    [TestMethod]
     public void WaveAssignmentsDoNotSplitOneRuntimeExpandedMethodAcrossMutants()
     {
         var states = new[]
         {
-            (1, 0, (IReadOnlyList<string>)["theory-row-1"]),
-            (2, 0, (IReadOnlyList<string>)["theory-row-2"]),
-            (3, 0, (IReadOnlyList<string>)["fact"]),
+            (1, (IReadOnlyList<string>)["theory-row-1"]),
+            (2, (IReadOnlyList<string>)["theory-row-2"]),
+            (3, (IReadOnlyList<string>)["fact"]),
         };
 
         var assignments = SingleMicrosoftTestPlatformRunner.BuildWaveAssignments(

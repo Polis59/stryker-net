@@ -20,7 +20,6 @@ public static class MutationBatchPlanner
     /// </summary>
     private const int MaximumSerialSessionTests = 256;
     private const int MaximumMutantsPerPackedSession = 16;
-    private const int MaximumMutantsPerOrdinaryWaveBatch = 64;
 
     /// <summary>
     /// Returns whether a planned group should use the broad-session concurrency gate.
@@ -73,18 +72,14 @@ public static class MutationBatchPlanner
 
         // Ordinary mutants may overlap because the MTP runner advances a batch in waves.
         // A test contested by several mutants is assigned to one of them in the current wave
-        // and remains available to the others in later waves. Start with twice the worker count,
-        // but bound each item so one source-heavy region cannot pin a worker for most of the
-        // campaign while other workers drain several light items. Persistent hosts make these
-        // extra scheduler boundaries cheap; the bound remains far above singleton scheduling.
+        // and remains available to the others in later waves. Chunking by twice the worker
+        // count keeps every worker fed without creating thousands of fixture-paying groups.
         if (remaining.Count > 0)
         {
             var chunkCount = Math.Min(
                 remaining.Count,
                 Math.Max(1, options.Concurrency) * 2);
-            var chunkSize = Math.Min(
-                MaximumMutantsPerOrdinaryWaveBatch,
-                (remaining.Count + chunkCount - 1) / chunkCount);
+            var chunkSize = (remaining.Count + chunkCount - 1) / chunkCount;
             groups.AddRange(remaining.Chunk(chunkSize).Select(chunk => chunk.ToList()));
         }
 

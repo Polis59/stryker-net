@@ -421,7 +421,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
 
             var requestedAssignments = BuildWaveAssignments(
                 unresolved.Select(state =>
-                    (state.Mutant.Id, state.Executed.Count, (IReadOnlyList<string>)state.Remaining)),
+                    (state.Mutant.Id, (IReadOnlyList<string>)state.Remaining)),
                 sliceSize,
                 testUid => activationFamilies.TryGetValue(testUid, out var family)
                     ? family
@@ -570,19 +570,14 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     }
 
     internal static IReadOnlyDictionary<string, int> BuildWaveAssignments(
-        IEnumerable<(int MutantId, int ExecutedCount, IReadOnlyList<string> Remaining)> states,
+        IEnumerable<(int MutantId, IReadOnlyList<string> Remaining)> states,
         int sliceSize,
         Func<string, string?>? activationFamilySelector = null,
         int maximumAssignments = MaximumWaveAssignments)
     {
         var assignments = new Dictionary<string, int>(StringComparer.Ordinal);
         var activationFamilyOwners = new Dictionary<string, int>(StringComparer.Ordinal);
-        // A growing slice must not let the first few survivors monopolize every request.
-        // Least-tested mutants go first, so the scheduler reaches every mutant before it
-        // spends another large slice proving an early survivor.
-        foreach (var (mutantId, _, remaining) in states
-                     .OrderBy(state => state.ExecutedCount)
-                     .ThenBy(state => state.MutantId))
+        foreach (var (mutantId, remaining) in states)
         {
             var assigned = 0;
             foreach (var testUid in remaining)
