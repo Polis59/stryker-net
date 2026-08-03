@@ -670,6 +670,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         ITimeoutValueCalculator? timeoutCalc)
     {
         var outcome = new MutationWaveOutcome();
+        var stopwatch = Stopwatch.StartNew();
         var publishedAssignments = WriteParallelMutantMap(requestedAssignments);
         try
         {
@@ -721,7 +722,32 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         }
         finally
         {
+            if (stopwatch.ElapsedMilliseconds >= 2_000)
+            {
+                _logger.LogInformation(
+                    "{RunnerId}: Slow mutation wave: duration {DurationMs} ms, assignments {Assignments}",
+                    RunnerId,
+                    stopwatch.ElapsedMilliseconds,
+                    DescribeWaveAssignments(requestedAssignments));
+            }
+
             WriteInactiveMutantMap();
+        }
+    }
+
+    private string DescribeWaveAssignments(IReadOnlyDictionary<string, int> assignments)
+    {
+        lock (_discoveryLock)
+        {
+            return string.Join(
+                " || ",
+                assignments.Select(assignment =>
+                {
+                    var name = _testDescriptions.TryGetValue(assignment.Key, out var description)
+                        ? description.Description.Name
+                        : assignment.Key;
+                    return $"{assignment.Value}:{name}";
+                }));
         }
     }
 
