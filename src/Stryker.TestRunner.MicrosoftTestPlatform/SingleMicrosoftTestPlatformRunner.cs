@@ -400,10 +400,12 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         var waveTestCount = 0;
         var confirmationCount = 0;
 
-        // Cheap early waves maximize first-kill throughput. A survivor is never inferred from
-        // this sample: unresolved mutants go through their complete assessing set below.
-        int[] waveSlices = [1, 2, 4];
-        foreach (var sliceSize in waveSlices)
+        // Cheap early waves maximize first-kill throughput. Later waves keep multiplexing the
+        // exact remaining coverage instead of collapsing thousands of unresolved mutants into
+        // one whole-session request apiece. A survivor is reported only after every assessing
+        // test actually executed while attributed to that mutant.
+        var sliceSize = 1;
+        while (true)
         {
             var unresolved = states
                 .Where(state => state.Unresolved && state.Remaining.Count > 0)
@@ -413,23 +415,10 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 break;
             }
 
-            var requestedAssignments = new Dictionary<string, int>(StringComparer.Ordinal);
-            foreach (var state in unresolved)
-            {
-                var assigned = 0;
-                for (var index = 0; assigned < sliceSize && index < state.Remaining.Count; index++)
-                {
-                    var testUid = state.Remaining[index];
-                    if (requestedAssignments.ContainsKey(testUid))
-                    {
-                        continue;
-                    }
-
-                    requestedAssignments[testUid] = state.Mutant.Id;
-                    state.Remaining.RemoveAt(index--);
-                    assigned++;
-                }
-            }
+            var requestedAssignments = BuildWaveAssignments(
+                unresolved.Select(state =>
+                    (state.Mutant.Id, (IReadOnlyList<string>)state.Remaining)),
+                sliceSize);
 
             if (requestedAssignments.Count == 0)
             {
@@ -438,9 +427,13 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
 
             waveCount++;
             waveTestCount += requestedAssignments.Count;
+            var assignedMutantIds = requestedAssignments.Values.ToHashSet();
             var outcome = await RunMutationWaveAsync(
                 assemblies,
-                unresolved.Select(state => state.Mutant).ToList(),
+                unresolved
+                    .Where(state => assignedMutantIds.Contains(state.Mutant.Id))
+                    .Select(state => state.Mutant)
+                    .ToList(),
                 requestedAssignments,
                 timeoutCalc).ConfigureAwait(false);
 
@@ -449,6 +442,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 if (outcome.ExecutedByMutant.TryGetValue(state.Mutant.Id, out var executed))
                 {
                     state.Executed.UnionWith(executed);
+                    state.Remaining.RemoveAll(executed.Contains);
                 }
 
                 if (outcome.FailedByMutant.TryGetValue(state.Mutant.Id, out var failed) && failed.Count > 0)
@@ -462,9 +456,17 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             {
                 break;
             }
+
+            if (outcome.ExecutedByMutant.Count == 0)
+            {
+                break;
+            }
+
+            sliceSize = Math.Min(sliceSize * 2, 16);
         }
 
-        foreach (var state in states.Where(candidate => candidate.Unresolved))
+        foreach (var state in states.Where(candidate =>
+                     candidate.Unresolved && candidate.Remaining.Count > 0))
         {
             confirmationCount++;
             ITestRunResult? result = null;
@@ -532,6 +534,32 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             confirmationCount,
             stopwatch.ElapsedMilliseconds);
         return new TestRunResult(true);
+    }
+
+    internal static IReadOnlyDictionary<string, int> BuildWaveAssignments(
+        IEnumerable<(int MutantId, IReadOnlyList<string> Remaining)> states,
+        int sliceSize)
+    {
+        var assignments = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var (mutantId, remaining) in states)
+        {
+            var assigned = 0;
+            foreach (var testUid in remaining)
+            {
+                if (assignments.ContainsKey(testUid))
+                {
+                    continue;
+                }
+
+                assignments[testUid] = mutantId;
+                if (++assigned >= sliceSize)
+                {
+                    break;
+                }
+            }
+        }
+
+        return assignments;
     }
 
     private List<string> GetWaveTestIdentifiers(IMutant mutant)
