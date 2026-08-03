@@ -725,13 +725,33 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             if (stopwatch.ElapsedMilliseconds >= 2_000)
             {
                 _logger.LogInformation(
-                    "{RunnerId}: Slow mutation wave: duration {DurationMs} ms, assignments {Assignments}",
+                    "{RunnerId}: Slow mutation wave: duration {DurationMs} ms, timed out {TimedOut}, " +
+                    "attributed timeouts {AttributedTimeouts}, assignments {Assignments}",
                     RunnerId,
                     stopwatch.ElapsedMilliseconds,
+                    outcome.TimedOut,
+                    DescribeWaveTimeouts(outcome.TimedOutByMutant),
                     DescribeWaveAssignments(requestedAssignments));
             }
 
             WriteInactiveMutantMap();
+        }
+    }
+
+    private string DescribeWaveTimeouts(
+        IReadOnlyDictionary<int, HashSet<string>> timedOutByMutant)
+    {
+        lock (_discoveryLock)
+        {
+            return string.Join(
+                " || ",
+                timedOutByMutant.SelectMany(bucket => bucket.Value.Select(testUid =>
+                {
+                    var name = _testDescriptions.TryGetValue(testUid, out var description)
+                        ? description.Description.Name
+                        : testUid;
+                    return $"{bucket.Key}:{name}";
+                })));
         }
     }
 
