@@ -35,6 +35,73 @@ public class SingleMicrosoftTestPlatformRunnerTests
     }
 
     [TestMethod]
+    public void WaveAssignmentsBoundTheWorkSentToOneTestSession()
+    {
+        var states = Enumerable.Range(0, 100)
+            .Select(mutantId =>
+                (mutantId, (IReadOnlyList<string>)[$"test-{mutantId}"]));
+
+        var assignments = SingleMicrosoftTestPlatformRunner.BuildWaveAssignments(
+            states,
+            sliceSize: 1);
+
+        assignments.Count.ShouldBe(64);
+    }
+
+    [TestMethod]
+    public void IdentitylessWaveFallbackIsLimitedToAssignedMutants()
+    {
+        var assignments = Enumerable.Range(0, 64)
+            .ToDictionary(index => $"test-{index}", index => index);
+
+        var fallback = SingleMicrosoftTestPlatformRunner.GetWaveFallbackMutantIds(
+            assignments,
+            sessionTimedOut: true,
+            sessionHadRuntimeIssue: false,
+            attributedTimedOutMutantIds: []);
+
+        fallback.ShouldBe(assignments.Values.ToHashSet(), ignoreOrder: true);
+        fallback.ShouldNotContain(64);
+    }
+
+    [TestMethod]
+    public void AttributedWaveTimeoutDoesNotTriggerConfirmationFallback()
+    {
+        var assignments = new Dictionary<string, int>
+        {
+            ["test-1"] = 1,
+            ["test-2"] = 2,
+        };
+
+        var fallback = SingleMicrosoftTestPlatformRunner.GetWaveFallbackMutantIds(
+            assignments,
+            sessionTimedOut: true,
+            sessionHadRuntimeIssue: false,
+            attributedTimedOutMutantIds: [1]);
+
+        fallback.ShouldBeEmpty();
+    }
+
+    [TestMethod]
+    public void EmptyWaveOutcomeConfirmsOnlyAssignedMutants()
+    {
+        var assignments = new Dictionary<string, int>
+        {
+            ["test-1"] = 1,
+            ["test-2"] = 2,
+        };
+
+        var fallback = SingleMicrosoftTestPlatformRunner.GetWaveFallbackMutantIds(
+            assignments,
+            sessionTimedOut: false,
+            sessionHadRuntimeIssue: false,
+            attributedTimedOutMutantIds: [],
+            waveMadeProgress: false);
+
+        fallback.ShouldBe([1, 2], ignoreOrder: true);
+    }
+
+    [TestMethod]
     public void FirstSingleMutantAttemptBailsOnATerminalTestVerdict()
     {
         var predicate = SingleMicrosoftTestPlatformRunner.CreateSingleMutantBailPredicate(

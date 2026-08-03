@@ -23,6 +23,7 @@ namespace Stryker.TestRunner.MicrosoftTestPlatform;
 /// </summary>
 public class SingleMicrosoftTestPlatformRunner : IDisposable
 {
+    private const int MaximumWaveAssignments = 64;
     private const string InactiveMutantMapHeader = "stryker-mtp-activation-map-v1\toff";
     // Parallel multiplexed sessions: the injected MutantControl resolves each test's assigned
     // mutant through xUnit's ambient TestContext and acknowledges this map itself, so a
@@ -379,10 +380,10 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     /// Advances an ordinary batch through small parallel waves. Each wave assigns a test to at
     /// most one mutant, so overlapping coverage is served across later requests instead of
     /// fragmenting the campaign into thousands of groups. Most killed mutants resolve in the
-    /// first seven test executions. Every unresolved ordinary mutant then receives a complete
-    /// whole-session run on its runner's reusable host. Exact lifecycle-bounded coverage has
-    /// already routed static and pre-test paths to isolation; only a lost-host retry needs a
-    /// pristine process.
+    /// first seven test executions. A wave request is bounded so an unhealthy session can send
+    /// only its assigned mutants to individual confirmation while unrelated mutants continue in
+    /// later waves. Exact lifecycle-bounded coverage has already routed static and pre-test paths
+    /// to isolation; only a lost-host retry needs a pristine process.
     /// </summary>
     private async Task<ITestRunResult> TestOrdinaryMutantsInWavesAsync(
         IReadOnlyList<string> assemblies,
@@ -458,21 +459,26 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 }
             }
 
-            if (outcome.HadRuntimeIssue)
+            var waveMadeProgress = outcome.ExecutedByMutant.Count > 0 ||
+                outcome.FailedByMutant.Count > 0 ||
+                outcome.TimedOutByMutant.Count > 0;
+            var fallbackMutantIds = GetWaveFallbackMutantIds(
+                requestedAssignments,
+                outcome.TimedOut,
+                outcome.HadRuntimeIssue,
+                outcome.TimedOutByMutant.Keys,
+                waveMadeProgress);
+            foreach (var state in unresolved.Where(state =>
+                         state.Unresolved && fallbackMutantIds.Contains(state.Mutant.Id)))
             {
-                break;
-            }
-
-            if (outcome.ExecutedByMutant.Count == 0)
-            {
-                break;
+                state.RequiresConfirmation = true;
+                state.Unresolved = false;
             }
 
             sliceSize = Math.Min(sliceSize * 2, 16);
         }
 
-        foreach (var state in states.Where(candidate =>
-                     candidate.Unresolved && candidate.Remaining.Count > 0))
+        foreach (var state in states.Where(candidate => candidate.RequiresConfirmation))
         {
             confirmationCount++;
             ITestRunResult? result = null;
@@ -553,6 +559,11 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             var assigned = 0;
             foreach (var testUid in remaining)
             {
+                if (assignments.Count >= MaximumWaveAssignments)
+                {
+                    return assignments;
+                }
+
                 if (assignments.ContainsKey(testUid))
                 {
                     continue;
@@ -567,6 +578,23 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         }
 
         return assignments;
+    }
+
+    internal static IReadOnlySet<int> GetWaveFallbackMutantIds(
+        IReadOnlyDictionary<string, int> requestedAssignments,
+        bool sessionTimedOut,
+        bool sessionHadRuntimeIssue,
+        IEnumerable<int> attributedTimedOutMutantIds,
+        bool waveMadeProgress = true)
+    {
+        var timeoutWasAttributed = attributedTimedOutMutantIds.Any();
+        if (!sessionHadRuntimeIssue && waveMadeProgress &&
+            (!sessionTimedOut || timeoutWasAttributed))
+        {
+            return new HashSet<int>();
+        }
+
+        return requestedAssignments.Values.ToHashSet();
     }
 
     private List<string> GetWaveTestIdentifiers(IMutant mutant)
@@ -666,6 +694,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         public HashSet<string> Failed { get; } = new(StringComparer.Ordinal);
         public HashSet<string> TimedOut { get; } = new(StringComparer.Ordinal);
         public bool Unresolved { get; set; } = true;
+        public bool RequiresConfirmation { get; set; }
         public bool Reported { get; set; }
     }
 
