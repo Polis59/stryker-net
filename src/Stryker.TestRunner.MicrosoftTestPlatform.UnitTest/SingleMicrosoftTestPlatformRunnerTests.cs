@@ -49,6 +49,22 @@ public class SingleMicrosoftTestPlatformRunnerTests
     }
 
     [TestMethod]
+    public void WaveAssignmentsCanShrinkAfterAnUnattributedTimeout()
+    {
+        var states = Enumerable.Range(0, 10)
+            .Select(mutantId =>
+                (mutantId, (IReadOnlyList<string>)[$"test-{mutantId}"]));
+
+        var assignments = SingleMicrosoftTestPlatformRunner.BuildWaveAssignments(
+            states,
+            sliceSize: 1,
+            activationFamilySelector: null,
+            maximumAssignments: 3);
+
+        assignments.Count.ShouldBe(3);
+    }
+
+    [TestMethod]
     public void WaveAssignmentsDoNotSplitOneRuntimeExpandedMethodAcrossMutants()
     {
         var states = new[]

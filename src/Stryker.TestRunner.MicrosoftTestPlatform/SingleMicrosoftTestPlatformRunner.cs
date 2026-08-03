@@ -402,6 +402,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         var waveTestCount = 0;
         var confirmationCount = 0;
         var activationFamilies = GetWaveActivationFamilies();
+        var maximumWaveAssignments = MaximumWaveAssignments;
 
         // Cheap early waves maximize first-kill throughput. Later waves keep multiplexing the
         // exact remaining coverage instead of collapsing thousands of unresolved mutants into
@@ -424,7 +425,8 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 sliceSize,
                 testUid => activationFamilies.TryGetValue(testUid, out var family)
                     ? family
-                    : null);
+                    : null,
+                maximumWaveAssignments);
 
             if (requestedAssignments.Count == 0)
             {
@@ -473,6 +475,16 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 outcome.HadRuntimeIssue,
                 outcome.TimedOutByMutant.Keys,
                 waveMadeProgress);
+            if (fallbackMutantIds.Count > 0 && requestedAssignments.Count > 1)
+            {
+                // An unattributed timeout identifies a bad request, not every mutant in it.
+                // Retry a smaller prefix until the failing work is isolated; only a single-test
+                // request is allowed to fall back to individual confirmation.
+                maximumWaveAssignments = Math.Max(1, requestedAssignments.Count / 2);
+                sliceSize = 1;
+                continue;
+            }
+
             foreach (var state in unresolved.Where(state =>
                          state.Unresolved && fallbackMutantIds.Contains(state.Mutant.Id)))
             {
@@ -481,6 +493,9 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             }
 
             sliceSize = Math.Min(sliceSize * 2, 16);
+            maximumWaveAssignments = Math.Min(
+                maximumWaveAssignments * 2,
+                MaximumWaveAssignments);
         }
 
         foreach (var state in states.Where(candidate => candidate.RequiresConfirmation))
@@ -557,7 +572,8 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     internal static IReadOnlyDictionary<string, int> BuildWaveAssignments(
         IEnumerable<(int MutantId, IReadOnlyList<string> Remaining)> states,
         int sliceSize,
-        Func<string, string?>? activationFamilySelector = null)
+        Func<string, string?>? activationFamilySelector = null,
+        int maximumAssignments = MaximumWaveAssignments)
     {
         var assignments = new Dictionary<string, int>(StringComparer.Ordinal);
         var activationFamilyOwners = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -566,7 +582,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             var assigned = 0;
             foreach (var testUid in remaining)
             {
-                if (assignments.Count >= MaximumWaveAssignments)
+                if (assignments.Count >= maximumAssignments)
                 {
                     return assignments;
                 }
