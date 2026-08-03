@@ -459,7 +459,11 @@ namespace Stryker
                 string methodKey = MethodAssignmentKey(displayName);
                 if (methodKey == null || !current.TryGetValue(methodKey, out resolved))
                 {
-                    RecordParallelError("Test case '" + testCaseUid + "' has no mutant assignment in the active MTP request.");
+                    RecordParallelError(
+                        "Test case '" + testCaseUid +
+                        "' with display name '" + displayName +
+                        "' and method key '" + methodKey +
+                        "' has no mutant assignment in the active MTP request.");
                     _parallelMemo.Value = new object[] { _parallelHeader, ParallelUnbound };
                     return true;
                 }
