@@ -377,13 +377,14 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     }
 
     /// <summary>
-    /// Advances an ordinary batch through small parallel waves. Each wave assigns a test to at
-    /// most one mutant, so overlapping coverage is served across later requests instead of
-    /// fragmenting the campaign into thousands of groups. Most killed mutants resolve in the
-    /// first seven test executions. A wave request is bounded so an unhealthy session can send
-    /// only its assigned mutants to individual confirmation while unrelated mutants continue in
-    /// later waves. Exact lifecycle-bounded coverage has already routed static and pre-test paths
-    /// to isolation; only a lost-host retry needs a pristine process.
+    /// Advances an ordinary batch through small parallel waves. Each wave assigns a test and its
+    /// run-time expansion family to at most one mutant, so overlapping coverage is served across
+    /// later requests instead of fragmenting the campaign into thousands of groups. Most killed
+    /// mutants resolve in the first seven test executions. A wave request is bounded so an
+    /// unhealthy session can send only its assigned mutants to individual confirmation while
+    /// unrelated mutants continue in later waves. Exact lifecycle-bounded coverage has already
+    /// routed static and pre-test paths to isolation; only a lost-host retry needs a pristine
+    /// process.
     /// </summary>
     private async Task<ITestRunResult> TestOrdinaryMutantsInWavesAsync(
         IReadOnlyList<string> assemblies,
@@ -400,6 +401,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         var waveCount = 0;
         var waveTestCount = 0;
         var confirmationCount = 0;
+        var activationFamilies = GetWaveActivationFamilies();
 
         // Cheap early waves maximize first-kill throughput. Later waves keep multiplexing the
         // exact remaining coverage instead of collapsing thousands of unresolved mutants into
@@ -419,7 +421,10 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             var requestedAssignments = BuildWaveAssignments(
                 unresolved.Select(state =>
                     (state.Mutant.Id, (IReadOnlyList<string>)state.Remaining)),
-                sliceSize);
+                sliceSize,
+                testUid => activationFamilies.TryGetValue(testUid, out var family)
+                    ? family
+                    : null);
 
             if (requestedAssignments.Count == 0)
             {
@@ -551,9 +556,11 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
 
     internal static IReadOnlyDictionary<string, int> BuildWaveAssignments(
         IEnumerable<(int MutantId, IReadOnlyList<string> Remaining)> states,
-        int sliceSize)
+        int sliceSize,
+        Func<string, string?>? activationFamilySelector = null)
     {
         var assignments = new Dictionary<string, int>(StringComparer.Ordinal);
+        var activationFamilyOwners = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (var (mutantId, remaining) in states)
         {
             var assigned = 0;
@@ -569,7 +576,20 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                     continue;
                 }
 
+                var activationFamily = activationFamilySelector?.Invoke(testUid);
+                if (activationFamily is not null &&
+                    activationFamilyOwners.TryGetValue(activationFamily, out var ownerId) &&
+                    ownerId != mutantId)
+                {
+                    continue;
+                }
+
                 assignments[testUid] = mutantId;
+                if (activationFamily is not null)
+                {
+                    activationFamilyOwners[activationFamily] = mutantId;
+                }
+
                 if (++assigned >= sliceSize)
                 {
                     break;
@@ -578,6 +598,23 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         }
 
         return assignments;
+    }
+
+    private Dictionary<string, string> GetWaveActivationFamilies()
+    {
+        var families = new Dictionary<string, string>(StringComparer.Ordinal);
+        lock (_discoveryLock)
+        {
+            foreach (var (testUid, description) in _testDescriptions)
+            {
+                if (MethodAssignmentKey(description.Description.Name) is { } methodKey)
+                {
+                    families[testUid] = methodKey;
+                }
+            }
+        }
+
+        return families;
     }
 
     internal static IReadOnlySet<int> GetWaveFallbackMutantIds(

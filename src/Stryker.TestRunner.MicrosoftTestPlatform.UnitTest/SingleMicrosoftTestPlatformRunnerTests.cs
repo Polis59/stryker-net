@@ -49,6 +49,28 @@ public class SingleMicrosoftTestPlatformRunnerTests
     }
 
     [TestMethod]
+    public void WaveAssignmentsDoNotSplitOneRuntimeExpandedMethodAcrossMutants()
+    {
+        var states = new[]
+        {
+            (1, (IReadOnlyList<string>)["theory-row-1"]),
+            (2, (IReadOnlyList<string>)["theory-row-2"]),
+            (3, (IReadOnlyList<string>)["fact"]),
+        };
+
+        var assignments = SingleMicrosoftTestPlatformRunner.BuildWaveAssignments(
+            states,
+            sliceSize: 1,
+            testUid => testUid.StartsWith("theory", StringComparison.Ordinal)
+                ? "method\ttheory"
+                : $"method\t{testUid}");
+
+        assignments["theory-row-1"].ShouldBe(1);
+        assignments.ContainsKey("theory-row-2").ShouldBeFalse();
+        assignments["fact"].ShouldBe(3);
+    }
+
+    [TestMethod]
     public void IdentitylessWaveFallbackIsLimitedToAssignedMutants()
     {
         var assignments = Enumerable.Range(0, 64)
