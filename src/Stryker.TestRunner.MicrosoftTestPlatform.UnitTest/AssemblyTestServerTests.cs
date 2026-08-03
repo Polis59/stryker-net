@@ -543,6 +543,44 @@ public class AssemblyTestServerTests
     }
 
     [TestMethod]
+    public async Task RunTestsAsync_PackedBailDiscardsTheHostBeforeReturning()
+    {
+        SetupSuccessfulConnection();
+
+        var neverCompletes = new TaskCompletionSource<ResponseListener>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var failed = new TestNodeUpdate(
+            new TestNode("uid-1", "Test1", "action", TestNodeStates.Failed),
+            "parent");
+        _clientMock
+            .Setup(c => c.RunTestsAsync(
+                It.IsAny<Guid>(),
+                It.IsAny<Func<TestNodeUpdate[], Task>>(),
+                null,
+                It.IsAny<TimeSpan?>(),
+                It.IsAny<CancellationToken>()))
+            .Returns<Guid, Func<TestNodeUpdate[], Task>, TestNode[]?, TimeSpan?, CancellationToken>(
+                async (_, callback, _, _, _) =>
+                {
+                    await callback([failed]);
+                    return await neverCompletes.Task;
+                });
+
+        using var server = CreateServer();
+        await server.StartAsync();
+        var (_, timedOut) = await server.RunTestsAsync(
+            null,
+            TimeSpan.FromSeconds(2),
+            _ => true,
+            stallDetection: false,
+            discardOnBail: true);
+
+        timedOut.ShouldBeFalse();
+        server.IsInitialized.ShouldBeFalse();
+        _processHandleMock.Verify(process => process.Kill(), Times.Once);
+    }
+
+    [TestMethod]
     public async Task StopAsync_ShouldDisposeResources()
     {
         SetupSuccessfulConnection();

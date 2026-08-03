@@ -135,7 +135,8 @@ internal sealed class AssemblyTestServer : IDisposable
         TestNode[]? testsToRun,
         TimeSpan? timeout,
         Func<TestNodeUpdate, bool>? bailPredicate = null,
-        bool stallDetection = true)
+        bool stallDetection = true,
+        bool discardOnBail = false)
     {
         if (!_isInitialized || _client is null)
         {
@@ -237,6 +238,11 @@ internal sealed class AssemblyTestServer : IDisposable
                 }
                 catch (OperationCanceledException) when (bailed)
                 {
+                    if (discardOnBail)
+                    {
+                        await StopAsync(force: true).ConfigureAwait(false);
+                    }
+
                     return (testResults.ToList(), false);
                 }
                 catch (OperationCanceledException ex) when (stalled)
@@ -296,6 +302,11 @@ internal sealed class AssemblyTestServer : IDisposable
         }
         catch (OperationCanceledException) when (bailed)
         {
+            if (discardOnBail)
+            {
+                await StopAsync(force: true).ConfigureAwait(false);
+            }
+
             return (testResults.ToList(), false);
         }
 

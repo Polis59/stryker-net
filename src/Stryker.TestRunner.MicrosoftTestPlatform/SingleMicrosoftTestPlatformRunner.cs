@@ -1755,14 +1755,31 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             // through the published map.
             WriteMutantIdToFile(mutantId);
 
-            // MTP acknowledges request cancellation before its test scheduler has necessarily
-            // drained. Replacing the map at that point lets leftover tests observe the next
-            // request's assignments. Packed waves are capped at 64 tests, so they finish their
-            // bounded request and preserve the activation-map boundary instead of bailing.
-            if (packedAssignments is { Count: > 0 } && bailPredicate is not null)
+            if (packedAssignments is { Count: > 0 } && mutants is { Count: > 0 } && bailPredicate is null)
             {
-                throw new InvalidOperationException(
-                    "A packed MTP request must finish before its activation map can be replaced.");
+                // Cancel when every assigned mutant has a verdict. MTP acknowledges cancellation
+                // before its scheduler necessarily drains, so the packed call path force-discards
+                // this host before the next request publishes a different activation map.
+                var unresolved = new HashSet<int>(mutants.Select(m => m.Id));
+                var bailLock = new object();
+                bailPredicate = update =>
+                {
+                    if (update.Node.ExecutionState is not (TestNodeStates.Failed or TestNodeStates.Error or TestNodeStates.TimedOut))
+                    {
+                        return false;
+                    }
+
+                    if (!packedAssignments.TryGetValue(update.Node.Uid, out var ownerId))
+                    {
+                        return false;
+                    }
+
+                    lock (bailLock)
+                    {
+                        unresolved.Remove(ownerId);
+                        return unresolved.Count == 0;
+                    }
+                };
             }
 
             var accumulator = new TestRunAccumulator();
@@ -1957,7 +1974,13 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             timeout = CalculateAssemblyTimeout(testsToRun, timeoutCalc, assembly, parallelSession);
         }
 
-        var (testResults, timedOut) = await RunAssemblyTestsInternalAsync(assembly, testUidFilter, timeout, bailPredicate, stallDetection: parallelSession).ConfigureAwait(false);
+        var (testResults, timedOut) = await RunAssemblyTestsInternalAsync(
+            assembly,
+            testUidFilter,
+            timeout,
+            bailPredicate,
+            stallDetection: parallelSession,
+            discardOnBail: parallelSession).ConfigureAwait(false);
 
         return (testResults as TestRunResult, timedOut, discoveredTests);
     }
@@ -1967,7 +1990,8 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         Func<TestNode, bool>? testUidFilter,
         TimeSpan? timeout = null,
         Func<TestNodeUpdate, bool>? bailPredicate = null,
-        bool stallDetection = false)
+        bool stallDetection = false,
+        bool discardOnBail = false)
     {
         // A crashed test host tears down the RPC connection, so the run throws (rather than timing out).
         // Retry once on a freshly started server: a crash caused by a *previous* mutant then self-heals
@@ -2016,7 +2040,12 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                     return (BuildTestRunResult([], tests?.Count ?? 0, TimeSpan.Zero), false);
                 }
 
-                var (testResults, timedOut) = await server.RunTestsAsync(testsToRun, timeout, bailPredicate, stallDetection).ConfigureAwait(false);
+                var (testResults, timedOut) = await server.RunTestsAsync(
+                    testsToRun,
+                    timeout,
+                    bailPredicate,
+                    stallDetection,
+                    discardOnBail).ConfigureAwait(false);
 
                 var duration = DateTime.UtcNow - startTime;
                 var result = BuildTestRunResult(
