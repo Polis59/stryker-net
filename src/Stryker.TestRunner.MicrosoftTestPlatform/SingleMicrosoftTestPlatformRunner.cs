@@ -29,6 +29,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     // mutant through xUnit's ambient TestContext and acknowledges this map itself, so a
     // multi-mutant request keeps the host's normal test parallelism.
     private const string ActiveParallelMutantMapHeaderPrefix = "stryker-mtp-activation-map-v1\tactive-parallel\t";
+    private const string ActiveTestJournalHeaderPrefix = "stryker-mtp-active-tests-v1\t";
 
     private readonly int _id;
     private readonly Dictionary<string, List<TestNode>> _testsByAssembly;
@@ -40,6 +41,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     private readonly string _mutantMapFilePath;
     private readonly string _mutantMapAcknowledgementFilePath;
     private readonly string _mutantMapErrorFilePath;
+    private readonly string _activeTestJournalFilePath;
     private readonly string _coverageFilePath;
     private readonly string _coverageMapFilePath;
     private readonly IStrykerOptions? _options;
@@ -56,6 +58,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     internal string MutantMapFilePath => _mutantMapFilePath;
     internal string MutantMapAcknowledgementFilePath => _mutantMapAcknowledgementFilePath;
     internal string MutantMapErrorFilePath => _mutantMapErrorFilePath;
+    internal string ActiveTestJournalFilePath => _activeTestJournalFilePath;
     internal string CoverageFilePath => _coverageFilePath;
     internal string CoverageMapFilePath => _coverageMapFilePath;
 
@@ -86,6 +89,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             Path.GetTempPath(),
             $"stryker-mutant-map-ack-{fileToken}.txt");
         _mutantMapErrorFilePath = Path.Combine(Path.GetTempPath(), $"stryker-mutant-map-error-{fileToken}.txt");
+        _activeTestJournalFilePath = Path.Combine(Path.GetTempPath(), $"stryker-active-tests-{fileToken}.txt");
         _coverageFilePath = Path.Combine(Path.GetTempPath(), $"stryker-coverage-{fileToken}.txt");
         _coverageMapFilePath = Path.Combine(Path.GetTempPath(), $"stryker-coverage-map-{fileToken}.txt");
 
@@ -100,6 +104,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         DeleteIfExists(_mutantMapErrorFilePath);
         _expectedMutantMapAcknowledgement = null;
         WriteTextAtomically(_mutantMapFilePath, InactiveMutantMapHeader + Environment.NewLine);
+        DeleteIfExists(_activeTestJournalFilePath);
     }
 
     /// <summary>
@@ -209,6 +214,9 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         WriteTextAtomically(
             _mutantMapFilePath,
             string.Join(Environment.NewLine, lines) + Environment.NewLine);
+        WriteTextAtomically(
+            _activeTestJournalFilePath,
+            ActiveTestJournalHeaderPrefix + acknowledgement + Environment.NewLine);
         _expectedMutantMapAcknowledgement = acknowledgement;
         return assignments;
     }
@@ -771,6 +779,78 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         }
     }
 
+    private IReadOnlyCollection<string> GetAttributedTimedOutTests(
+        IReadOnlyDictionary<string, int> packedAssignments)
+    {
+        if (_expectedMutantMapAcknowledgement is not { } acknowledgement)
+        {
+            return [];
+        }
+
+        var activeMutantIds = ReadActiveMutantIds(
+            _activeTestJournalFilePath,
+            acknowledgement);
+        if (activeMutantIds.Count == 0)
+        {
+            return [];
+        }
+
+        return activeMutantIds
+            .Select(mutantId => packedAssignments
+                .FirstOrDefault(assignment =>
+                    assignment.Value == mutantId &&
+                    !assignment.Key.StartsWith("method\t", StringComparison.Ordinal)))
+            .Where(assignment => assignment.Key is not null)
+            .Select(assignment => assignment.Key)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+    }
+
+    internal static IReadOnlySet<int> ReadActiveMutantIds(
+        string journalFilePath,
+        string acknowledgement)
+    {
+        if (!File.Exists(journalFilePath))
+        {
+            return new HashSet<int>();
+        }
+
+        var lines = File.ReadAllLines(journalFilePath);
+        if (lines.Length == 0 ||
+            !string.Equals(
+                lines[0],
+                ActiveTestJournalHeaderPrefix + acknowledgement,
+                StringComparison.Ordinal))
+        {
+            return new HashSet<int>();
+        }
+
+        var activeTests = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var line in lines.Skip(1))
+        {
+            var fields = line.Split('\t');
+            if (fields.Length == 4 &&
+                string.Equals(fields[0], "start", StringComparison.Ordinal) &&
+                string.Equals(fields[1], acknowledgement, StringComparison.Ordinal) &&
+                int.TryParse(
+                    fields[3],
+                    System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out var mutantId))
+            {
+                activeTests[fields[2]] = mutantId;
+            }
+            else if (fields.Length == 3 &&
+                string.Equals(fields[0], "finish", StringComparison.Ordinal) &&
+                string.Equals(fields[1], acknowledgement, StringComparison.Ordinal))
+            {
+                activeTests.Remove(fields[2]);
+            }
+        }
+
+        return activeTests.Values.ToHashSet();
+    }
+
     private static void AddToBucket(
         IDictionary<int, HashSet<string>> buckets,
         int mutantId,
@@ -1199,6 +1279,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             ["STRYKER_MUTANT_MAP_FILE"] = _mutantMapFilePath,
             ["STRYKER_MUTANT_MAP_ACK_FILE"] = _mutantMapAcknowledgementFilePath,
             ["STRYKER_MUTANT_MAP_ERROR_FILE"] = _mutantMapErrorFilePath,
+            ["STRYKER_MUTANT_MAP_ACTIVE_FILE"] = _activeTestJournalFilePath,
         };
 
         ExternalEnvironmentVariables.Add(envVars);
@@ -1879,6 +1960,11 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                             {
                                 await DiscardServerAsync(assembly).ConfigureAwait(false);
                             }
+
+                            foreach (var testUid in GetAttributedTimedOutTests(packedAssignments))
+                            {
+                                accumulator.TimedOutTests.Add(testUid);
+                            }
                         }
                         else if (useFreshProcess)
                         {
@@ -2250,6 +2336,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 DeleteIfExists(_mutantMapFilePath);
                 DeleteIfExists(_mutantMapAcknowledgementFilePath);
                 DeleteIfExists(_mutantMapErrorFilePath);
+                DeleteIfExists(_activeTestJournalFilePath);
                 if (File.Exists(_coverageFilePath))
                 {
                     File.Delete(_coverageFilePath);

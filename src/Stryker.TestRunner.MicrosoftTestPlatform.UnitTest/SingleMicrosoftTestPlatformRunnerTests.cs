@@ -121,6 +121,60 @@ public class SingleMicrosoftTestPlatformRunnerTests
     }
 
     [TestMethod]
+    public void ActiveTestJournalAttributesOnlyTestsStillRunningAtTimeout()
+    {
+        var path = Path.GetTempFileName();
+        const string acknowledgement = "request-token";
+        try
+        {
+            File.WriteAllLines(
+                path,
+                [
+                    $"stryker-mtp-active-tests-v1\t{acknowledgement}",
+                    $"start\t{acknowledgement}\ttest-1\t101",
+                    $"start\t{acknowledgement}\ttest-2\t102",
+                    $"finish\t{acknowledgement}\ttest-1",
+                    $"start\told-token\tstale-test\t999",
+                ]);
+
+            var active = SingleMicrosoftTestPlatformRunner.ReadActiveMutantIds(
+                path,
+                acknowledgement);
+
+            active.ShouldBe([102], ignoreOrder: true);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [TestMethod]
+    public void ActiveTestJournalRejectsRecordsFromAnotherRequest()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllLines(
+                path,
+                [
+                    "stryker-mtp-active-tests-v1\told-token",
+                    "start\told-token\ttest-1\t101",
+                ]);
+
+            var active = SingleMicrosoftTestPlatformRunner.ReadActiveMutantIds(
+                path,
+                "current-token");
+
+            active.ShouldBeEmpty();
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [TestMethod]
     public void EmptyWaveOutcomeConfirmsOnlyAssignedMutants()
     {
         var assignments = new Dictionary<string, int>
