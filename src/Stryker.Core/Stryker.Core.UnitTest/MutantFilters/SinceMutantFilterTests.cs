@@ -311,6 +311,42 @@ public class SinceMutantFilterTests : TestBase
     }
 
     [TestMethod]
+    public void Should_RunUnmatchedMutants_AndReuseMatchedMutants_WhenBaselineHasNoChanges()
+    {
+        var options = new StrykerOptions
+        {
+            WithBaseline = true,
+            ProjectVersion = "version"
+        };
+        var diffProvider = new Mock<IDiffProvider>();
+        diffProvider.Setup(provider => provider.ScanDiff()).Returns(new DiffResult
+        {
+            ChangedSourceFiles = [],
+            ChangedTestFiles = []
+        });
+        var matched = new Mutant
+        {
+            ResultStatus = MutantStatus.Killed,
+            ResultStatusReason = "Result based on previous run"
+        };
+        var unmatched = new Mutant { ResultStatus = MutantStatus.Pending };
+        var inconclusive = new Mutant
+        {
+            ResultStatus = MutantStatus.Pending,
+            ResultStatusReason = "Result based on previous run was inconclusive"
+        };
+        var target = new SinceMutantFilter(diffProvider.Object);
+
+        var result = target.FilterMutants(
+            [matched, unmatched, inconclusive],
+            new CsharpFileLeaf(),
+            options);
+
+        result.ShouldBe([unmatched, inconclusive]);
+        matched.ResultStatus.ShouldBe(MutantStatus.Killed);
+    }
+
+    [TestMethod]
     public void Should_ReturnAllMutants_When_NonSourceCodeFile_In_Tests_Has_Changed()
     {
         // Arrange

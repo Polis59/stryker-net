@@ -1,7 +1,10 @@
 using System.IO;
+using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Shouldly;
+using Stryker.Abstractions;
 using Stryker.Core.Baseline.Utils;
+using Stryker.Core.Mutants;
 using Stryker.Core.Reporters.Json;
 using Stryker.Core.Reporters.Json.SourceFiles;
 
@@ -10,6 +13,47 @@ namespace Stryker.Core.UnitTest.Baseline.Utils;
 [TestClass]
 public class BaselineMutantHelperTests : TestBase
 {
+    [TestMethod]
+    public void GetMutantMatchingSourceCodeShouldIncludeReplacementIdentity()
+    {
+        var original = SyntaxFactory.ParseExpression("value > 0");
+        var expected = new Mutant
+        {
+            Mutation = new Mutation
+            {
+                OriginalNode = original,
+                ReplacementNode = SyntaxFactory.ParseExpression("value >= 0"),
+                DisplayName = "logical"
+            }
+        };
+        var sibling = new Mutant
+        {
+            Mutation = new Mutation
+            {
+                OriginalNode = original,
+                ReplacementNode = SyntaxFactory.ParseExpression("false"),
+                DisplayName = "logical"
+            }
+        };
+        var baseline = new JsonMutant
+        {
+            MutatorName = "logical",
+            Replacement = "value >= 0",
+            Location = new Location
+            {
+                Start = new Position { Line = 1, Column = 1 },
+                End = new Position { Line = 1, Column = 10 }
+            }
+        };
+
+        var result = new BaselineMutantHelper().GetMutantMatchingSourceCode(
+            [expected, sibling],
+            baseline,
+            "value > 0");
+
+        result.ShouldHaveSingleItem().ShouldBe(expected);
+    }
+
     [TestMethod]
     public void GetMutantSourceShouldReturnMutantSource()
     {

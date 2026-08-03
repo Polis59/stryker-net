@@ -1,4 +1,7 @@
+using Microsoft.CodeAnalysis.CSharp;
+using Moq;
 using Shouldly;
+using Stryker.Abstractions;
 using Stryker.TestRunner.MicrosoftTestPlatform.Models;
 
 namespace Stryker.TestRunner.MicrosoftTestPlatform.UnitTest;
@@ -6,6 +9,277 @@ namespace Stryker.TestRunner.MicrosoftTestPlatform.UnitTest;
 [TestClass]
 public class SingleMicrosoftTestPlatformRunnerTests
 {
+    [TestMethod]
+    public void WaveTestsRunFastestFirstAndUnknownDurationsLast()
+    {
+        var durations = new Dictionary<string, TimeSpan>
+        {
+            ["slow"] = TimeSpan.FromSeconds(10),
+            ["fast-b"] = TimeSpan.FromMilliseconds(5),
+            ["fast-a"] = TimeSpan.FromMilliseconds(5),
+        };
+
+        var ordered = SingleMicrosoftTestPlatformRunner.OrderWaveTestIdentifiers(
+            ["slow", "unknown", "fast-b", "fast-a"],
+            identifier => durations.TryGetValue(identifier, out var duration)
+                ? duration
+                : null);
+
+        ordered.ShouldBe(["fast-a", "fast-b", "slow", "unknown"]);
+    }
+
+    [TestMethod]
+    public void WaveTestsRunProfiledKillerBeforeFasterTests()
+    {
+        var ordered = SingleMicrosoftTestPlatformRunner.OrderWaveTestIdentifiers(
+            ["fast", "killer", "slow"],
+            identifier => identifier switch
+            {
+                "fast" => TimeSpan.FromMilliseconds(1),
+                "killer" => TimeSpan.FromSeconds(1),
+                _ => TimeSpan.FromSeconds(2),
+            },
+            identifier => identifier == "killer" ? 1 : 0);
+
+        ordered.ShouldBe(["killer", "fast", "slow"]);
+    }
+
+    [TestMethod]
+    public void ProfiledWaveDefersFallbackTestsUntilTheKillerHasRun()
+    {
+        var plan = SingleMicrosoftTestPlatformRunner.BuildPrioritizedWaveTestPlan(
+            ["fast-fallback", "killer", "slow-fallback"],
+            identifier => identifier == "fast-fallback"
+                ? TimeSpan.FromMilliseconds(1)
+                : TimeSpan.FromSeconds(1),
+            identifier => identifier == "killer" ? 1 : 0);
+
+        plan.Priority.ShouldBe(["killer"]);
+        plan.Fallback.ShouldBe(["fast-fallback", "slow-fallback"]);
+    }
+
+    [TestMethod]
+    public void KnownTimeoutTestsMoveBehindUntriedFallbackTests()
+    {
+        var identifiers = new List<string> { "timeout-a", "fast", "timeout-b", "slow" };
+
+        SingleMicrosoftTestPlatformRunner.DeprioritizeKnownTimeoutTests(
+            identifiers,
+            identifier => identifier.StartsWith("timeout", StringComparison.Ordinal));
+
+        identifiers.ShouldBe(["fast", "slow", "timeout-a", "timeout-b"]);
+    }
+
+    [TestMethod]
+    public void IsolationTestsPreferPriorKillsThenFastestDuration()
+    {
+        var scores = new Dictionary<string, int>
+        {
+            ["prior-slow"] = 2,
+            ["prior-fast"] = 2,
+            ["new-fast"] = 0,
+        };
+        var durations = new Dictionary<string, TimeSpan>
+        {
+            ["prior-slow"] = TimeSpan.FromSeconds(2),
+            ["prior-fast"] = TimeSpan.FromMilliseconds(2),
+            ["new-fast"] = TimeSpan.FromMilliseconds(1),
+        };
+
+        var ordered = SingleMicrosoftTestPlatformRunner.OrderIsolationTests(
+            ["new-fast", "prior-slow", "prior-fast", "unknown"],
+            test => scores.GetValueOrDefault(test),
+            test => durations.TryGetValue(test, out var duration) ? duration : null,
+            test => test);
+
+        ordered.ShouldBe(["prior-fast", "prior-slow", "new-fast", "unknown"]);
+    }
+
+    [TestMethod]
+    public void IsolationUsesOnePriorityBatchThenOneBulkRemainder()
+    {
+        var ordered = Enumerable.Range(0, 20).ToList();
+
+        var batches = SingleMicrosoftTestPlatformRunner.BuildIsolationTestBatches(
+            ordered,
+            priorityBatchSize: 8);
+
+        batches.Select(batch => batch.Count).ShouldBe([8, 12]);
+        batches.SelectMany(batch => batch).ShouldBe(ordered);
+    }
+
+    [TestMethod]
+    public void WaveAssignmentsQuarantineKnownTimeoutsWhileUntriedTestsRemain()
+    {
+        var assignments = SingleMicrosoftTestPlatformRunner.BuildWaveAssignments(
+            [
+                (1, (IReadOnlyList<string>)["timeout-a", "untried"]),
+                (2, (IReadOnlyList<string>)["timeout-b"]),
+            ],
+            sliceSize: 2,
+            deferredTestSelector: test => test.StartsWith("timeout", StringComparison.Ordinal));
+
+        assignments.ShouldBe(new Dictionary<string, int> { ["untried"] = 1 });
+    }
+
+    [TestMethod]
+    public void WaveAssignmentsBatchKnownTimeoutsWhenNoUntriedTestsRemain()
+    {
+        var assignments = SingleMicrosoftTestPlatformRunner.BuildWaveAssignments(
+            [
+                (1, (IReadOnlyList<string>)["timeout-a"]),
+                (2, (IReadOnlyList<string>)["timeout-b"]),
+            ],
+            sliceSize: 1,
+            deferredTestSelector: _ => true);
+
+        assignments.ShouldBe(new Dictionary<string, int>
+        {
+            ["timeout-a"] = 1,
+            ["timeout-b"] = 2,
+        });
+    }
+
+    [TestMethod]
+    public void MutationPriorityPrefersStableTestUidAndFallsBackToName()
+    {
+        var priorities = new Dictionary<string, int>
+        {
+            ["stable-uid"] = 2,
+            ["test-name"] = 1,
+        };
+
+        SingleMicrosoftTestPlatformRunner.ResolveMutationPriority(
+            priorities,
+            "stable-uid",
+            "test-name").ShouldBe(2);
+        SingleMicrosoftTestPlatformRunner.ResolveMutationPriority(
+            priorities,
+            "other-uid",
+            "test-name").ShouldBe(1);
+        SingleMicrosoftTestPlatformRunner.ResolveMutationPriority(
+            priorities,
+            "other-uid",
+            "other-name").ShouldBe(0);
+    }
+
+    [TestMethod]
+    public void IsolationBatchSizeMustBePositive()
+    {
+        Should.Throw<ArgumentOutOfRangeException>(() =>
+            SingleMicrosoftTestPlatformRunner.BuildIsolationTestBatches([1], 0));
+    }
+
+    [TestMethod]
+    public void IsolationPriorityFilePreservesDeclaredOrderAndIgnoresComments()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllLines(path, ["# measured profile", "first", "second", "first", ""]);
+
+            var priorities = SingleMicrosoftTestPlatformRunner.LoadIsolationTestPriorities(path);
+
+            priorities.Count.ShouldBe(2);
+            priorities["first"].ShouldBeGreaterThan(priorities["second"]);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [TestMethod]
+    public void MissingIsolationPriorityFileFailsClosed()
+    {
+        Should.Throw<FileNotFoundException>(() =>
+            SingleMicrosoftTestPlatformRunner.LoadIsolationTestPriorities(
+                Path.Combine(Path.GetTempPath(), $"missing-{Guid.NewGuid():N}.txt")));
+    }
+
+    [TestMethod]
+    public void IsolationMutationProfilePreservesPerMutationOrder()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            const string mutation = "src/a.cs\t1\t2\t1\t3\tBoolean literal\tabc";
+            const string otherMutation = "src/b.cs\t4\t5\t4\t6\tString literal\tdef";
+            File.WriteAllLines(
+                path,
+                ["# measured profile", $"{mutation}\tfirst", $"{mutation}\tsecond", $"{otherMutation}\tother"]);
+
+            var priorities =
+                SingleMicrosoftTestPlatformRunner.LoadIsolationMutationPriorities(path);
+
+            priorities.Keys.ShouldBe([mutation, otherMutation], ignoreOrder: true);
+            priorities[mutation]["first"].ShouldBeGreaterThan(priorities[mutation]["second"]);
+            priorities[otherMutation].Keys.ShouldBe(["other"]);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [TestMethod]
+    public void MalformedIsolationMutationProfileFailsClosed()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(path, "not-a-mutant-profile");
+
+            Should.Throw<InvalidDataException>(() =>
+                SingleMicrosoftTestPlatformRunner.LoadIsolationMutationPriorities(path));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [TestMethod]
+    public void CollectibleKillRequiresFailureAndVerifiedUnload()
+    {
+        var failed = new CollectibleIsolationTestResult("test", "failed", "mutant detected");
+        var passed = new CollectibleIsolationTestResult("test", "passed", null);
+
+        SingleMicrosoftTestPlatformRunner.CanTrustCollectibleKill(
+            new([failed], null, 1, Unloaded: true)).ShouldBeTrue();
+        SingleMicrosoftTestPlatformRunner.CanTrustCollectibleKill(
+            new([passed], null, 1, Unloaded: true)).ShouldBeFalse();
+        SingleMicrosoftTestPlatformRunner.CanTrustCollectibleKill(
+            new([failed], null, 1, Unloaded: false)).ShouldBeFalse();
+        SingleMicrosoftTestPlatformRunner.CanTrustCollectibleKill(
+            new([failed], "host error", 1, Unloaded: true)).ShouldBeFalse();
+        SingleMicrosoftTestPlatformRunner.CanTrustCollectibleKill(
+            new([failed], null, 1, Unloaded: true, SessionTimedOut: true)).ShouldBeFalse();
+    }
+
+    [TestMethod]
+    public void MutationProfileKeyIsStableAcrossWorkspaceRoots()
+    {
+        var tree = CSharpSyntaxTree.ParseText(
+            "namespace Example;\nclass Value { bool Get() => true; }\n",
+            path: @"C:\agent\work\repository\src\Example\Value.cs");
+        var original = tree.GetRoot().DescendantTokens().Single(token => token.ValueText == "true").Parent!;
+        var mutant = new Mock<IMutant>();
+        mutant.SetupGet(item => item.Mutation).Returns(new Mutation
+        {
+            OriginalNode = original,
+            ReplacementNode = SyntaxFactory.LiteralExpression(
+                Microsoft.CodeAnalysis.CSharp.SyntaxKind.FalseLiteralExpression),
+            DisplayName = "Boolean literal mutation",
+        });
+
+        var key = SingleMicrosoftTestPlatformRunner.BuildMutationProfileKey(mutant.Object);
+
+        key.ShouldBe(
+            "src/Example/Value.cs\t2\t29\t2\t33\tBoolean literal mutation\t" +
+            "fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa");
+    }
+
     [TestMethod]
     public void CompleteWaveAssignmentsAdvanceContendedMutants()
     {

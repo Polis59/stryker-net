@@ -415,4 +415,57 @@ public class BaselineMutantFilterTests : TestBase
         // Assert
         results.ShouldHaveSingleItem();
     }
+
+    [TestMethod]
+    public void FilterMutants_MatchesRepositoryRelativePathAcrossRunnerRoots()
+    {
+        var branchProvider = new Mock<IGitInfoProvider>();
+        branchProvider.SetupGet(provider => provider.RepositoryPath)
+            .Returns(@"C:\agent-b\repo");
+        var baselineProvider = new Mock<IBaselineProvider>();
+        var baselineMutantHelper = new Mock<IBaselineMutantHelper>();
+        var options = new StrykerOptions
+        {
+            WithBaseline = true,
+            ProjectVersion = "version"
+        };
+        var file = new CsharpFileLeaf
+        {
+            FullPath = @"C:\agent-b\repo\src\Product\foo.cs",
+            RelativePath = @"C:\agent-b\repo\src\Product\foo.cs"
+        };
+        var mutant = new Mutant { ResultStatus = MutantStatus.Pending };
+        var baselineMutant = new JsonMutant { Status = "Killed" };
+        var baselineFile = new MockJsonReportFileComponent(
+            "",
+            "",
+            new HashSet<IJsonMutant> { baselineMutant });
+        var baseline = new MockJsonReport(
+            null,
+            new Dictionary<string, ISourceFile>
+            {
+                ["/agent-a/repo/src/Product/foo.cs"] = baselineFile
+            });
+        baselineProvider.Setup(provider => provider.Load(It.IsAny<string>()))
+            .Returns(Task.FromResult((IJsonReport)baseline));
+        baselineMutantHelper.Setup(helper => helper.GetMutantSourceCode(
+                baselineFile.Source,
+                baselineMutant))
+            .Returns("source");
+        baselineMutantHelper.Setup(helper => helper.GetMutantMatchingSourceCode(
+                It.IsAny<IEnumerable<IMutant>>(),
+                baselineMutant,
+                "source"))
+            .Returns([mutant]);
+        var target = new BaselineMutantFilter(
+            options,
+            baselineProvider.Object,
+            branchProvider.Object,
+            baselineMutantHelper.Object);
+
+        var result = target.FilterMutants([mutant], file, options);
+
+        result.ShouldHaveSingleItem().ResultStatus.ShouldBe(MutantStatus.Killed);
+        mutant.ResultStatusReason.ShouldBe("Result based on previous run");
+    }
 }

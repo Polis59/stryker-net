@@ -524,7 +524,7 @@ Default: `false`
 Command line: `--with-baseline:feat-2`  
 Config file: `"baseline": { }`
 
-Enabling `with-baseline` saves the mutation report to a storage location such as the filesystem. The mutation report is loaded at the start of the next mutation run. Any changed source code or unit test results in a reset of the mutants affected by the change. For unchanged mutants the previous result is reused. This feature expands on the [since](#since-flag-committish) feature by providing you with a full report after a partial mutation testrun.
+Enabling `with-baseline` saves the mutation report to a storage location such as the filesystem. The mutation report is loaded at the start of the next mutation run. Any changed source code or unit test results in a reset of the mutants affected by the change. For unchanged mutants the previous result is reused. Disk baselines can be restored on another runner or under another checkout root. A mutant is reused only when its source text, replacement, mutator, and mapped source span match exactly; missing or ambiguous baseline evidence causes that mutant to run. This feature expands on the [since](#since-flag-committish) feature by providing you with a full report after a partial mutation testrun.
 
 The report name is based on the current branch name or the [project-info.version](#project-infoversion-committish).
 

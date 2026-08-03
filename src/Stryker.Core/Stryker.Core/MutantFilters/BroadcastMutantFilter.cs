@@ -27,6 +27,17 @@ public class BroadcastMutantFilter : IMutantFilter
             // All mutants that weren't filtered out by a previous filter but were by the current filter are set to Ignored
             foreach (var skippedMutant in mutantsToTest.Except(remainingMutantsToTest))
             {
+                // Baseline mode deliberately excludes unchanged mutants from execution after
+                // restoring their prior verdict. Preserve that evidence in the complete report;
+                // replacing it with Ignored would make the baseline both unverifiable and
+                // unusable by the next run.
+                if (mutantFilter.Type == MutantFilter.Since &&
+                    options.WithBaseline &&
+                    skippedMutant.ResultStatusReason == BaselineMutantFilter.ReusedResultReason)
+                {
+                    continue;
+                }
+
                 skippedMutant.ResultStatus = MutantStatus.Ignored;
                 skippedMutant.ResultStatusReason = $"Removed by {mutantFilter.DisplayName}";
             }

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.CodeAnalysis;
@@ -18,6 +19,8 @@ namespace Stryker.Core.MutantFilters;
 
 public class BaselineMutantFilter : IMutantFilter
 {
+    internal const string ReusedResultReason = "Result based on previous run";
+
     private readonly IBaselineProvider _baselineProvider;
     private readonly IGitInfoProvider _gitInfoProvider;
     private readonly ILogger<BaselineMutantFilter> _logger;
@@ -68,12 +71,10 @@ public class BaselineMutantFilter : IMutantFilter
 
     private void UpdateMutantsWithBaselineStatus(IEnumerable<IMutant> mutants, IReadOnlyFileLeaf file)
     {
-        if (!_baseline.Files.ContainsKey(FilePathUtils.NormalizePathSeparators(file.RelativePath)))
+        if (!TryResolveBaselineFile(file, out var baselineFile))
         {
             return;
         }
-
-        var baselineFile = _baseline.Files[FilePathUtils.NormalizePathSeparators(file.RelativePath)];
 
         if (baselineFile is { })
         {
@@ -98,6 +99,48 @@ public class BaselineMutantFilter : IMutantFilter
         }
     }
 
+    private bool TryResolveBaselineFile(IReadOnlyFileLeaf file, out ISourceFile baselineFile)
+    {
+        var normalizedPath = FilePathUtils.NormalizePathSeparators(file.RelativePath);
+        if (_baseline.Files.TryGetValue(normalizedPath, out baselineFile))
+        {
+            return true;
+        }
+
+        // JSON reports historically persisted absolute source paths. A disk baseline restored on
+        // another runner therefore has a different root even though it describes the same file.
+        // Resolve the current file relative to the repository and require one unambiguous suffix
+        // match. Ambiguous or unrelativizable paths fail closed and leave the mutants pending.
+        var repositoryPath = _gitInfoProvider.RepositoryPath;
+        var fullPath = string.IsNullOrWhiteSpace(file.FullPath)
+            ? file.RelativePath
+            : file.FullPath;
+        if (string.IsNullOrWhiteSpace(repositoryPath) || string.IsNullOrWhiteSpace(fullPath))
+        {
+            baselineFile = null;
+            return false;
+        }
+
+        var repositoryRelativePath = FilePathUtils.NormalizePathSeparators(
+            Path.GetRelativePath(repositoryPath, fullPath))
+            .TrimStart('.', Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var suffix = Path.DirectorySeparatorChar + repositoryRelativePath;
+        var matches = _baseline.Files
+            .Where(entry =>
+                FilePathUtils.NormalizePathSeparators(entry.Key)
+                    .EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+            .Take(2)
+            .ToList();
+        if (matches.Count == 1)
+        {
+            baselineFile = matches[0].Value;
+            return true;
+        }
+
+        baselineFile = null;
+        return false;
+    }
+
     private static void SetMutantStatusToBaselineMutantStatus(IJsonMutant baselineMutant,
         IEnumerable<IMutant> matchingMutants)
     {
@@ -105,7 +148,7 @@ public class BaselineMutantFilter : IMutantFilter
         {
             var matchingMutant = matchingMutants.First();
             matchingMutant.ResultStatus = (MutantStatus)Enum.Parse(typeof(MutantStatus), baselineMutant.Status);
-            matchingMutant.ResultStatusReason = "Result based on previous run";
+            matchingMutant.ResultStatusReason = ReusedResultReason;
         }
         else
         {

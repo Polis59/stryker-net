@@ -15,9 +15,9 @@ public enum MutantFilter
 
     FilePattern,
 
-    Since,
-
     Baseline,
+
+    Since,
 
     IgnoreBlockRemoval,
 }
