@@ -27,4 +27,13 @@ public class SingleMicrosoftTestPlatformRunnerTests
         SingleMicrosoftTestPlatformRunner.CreateSingleMutantBailPredicate(
             isRuntimeRetry: true).ShouldBeNull();
     }
+
+    [TestMethod]
+    public void OrdinaryWaveConfirmationReusesTheWarmHostUntilARuntimeRetry()
+    {
+        SingleMicrosoftTestPlatformRunner.UseFreshProcessForOrdinaryConfirmation(
+            attempt: 1).ShouldBeFalse();
+        SingleMicrosoftTestPlatformRunner.UseFreshProcessForOrdinaryConfirmation(
+            attempt: 2).ShouldBeTrue();
+    }
 }

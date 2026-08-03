@@ -379,8 +379,10 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     /// Advances an ordinary batch through small parallel waves. Each wave assigns a test to at
     /// most one mutant, so overlapping coverage is served across later requests instead of
     /// fragmenting the campaign into thousands of groups. Most killed mutants resolve in the
-    /// first seven test executions. Every unresolved mutant then receives a complete fresh-process
-    /// run before a survivor, timeout, or runtime-error verdict is accepted.
+    /// first seven test executions. Every unresolved ordinary mutant then receives a complete
+    /// whole-session run on its runner's reusable host. Exact lifecycle-bounded coverage has
+    /// already routed static and pre-test paths to isolation; only a lost-host retry needs a
+    /// pristine process.
     /// </summary>
     private async Task<ITestRunResult> TestOrdinaryMutantsInWavesAsync(
         IReadOnlyList<string> assemblies,
@@ -476,7 +478,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                     update: null,
                     timeoutCalc,
                     BuildTestUidFilter([state.Mutant]),
-                    useFreshProcess: true,
+                    useFreshProcess: UseFreshProcessForOrdinaryConfirmation(attempt),
                     bailPredicate: CreateSingleMutantBailPredicate(isRuntimeRetry: attempt > 1))
                     .ConfigureAwait(false);
                 if (!result.SessionHadRuntimeIssue || attempt == maxAttempts)
@@ -522,7 +524,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
 
         _logger.LogInformation(
             "{RunnerId}: Wave batch completed: mutants {MutantCount}, waves {WaveCount}, " +
-            "wave tests {WaveTestCount}, fresh confirmations {ConfirmationCount}, duration {DurationMs} ms",
+            "wave tests {WaveTestCount}, confirmations {ConfirmationCount}, duration {DurationMs} ms",
             RunnerId,
             mutants.Count,
             waveCount,
@@ -617,6 +619,8 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         public bool TimedOut { get; set; }
         public bool HadRuntimeIssue { get; set; }
     }
+
+    internal static bool UseFreshProcessForOrdinaryConfirmation(int attempt) => attempt > 1;
 
     internal static Func<TestNodeUpdate, bool>? CreateSingleMutantBailPredicate(bool isRuntimeRetry) =>
         isRuntimeRetry
