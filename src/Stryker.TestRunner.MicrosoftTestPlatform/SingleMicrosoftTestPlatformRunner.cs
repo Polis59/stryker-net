@@ -393,7 +393,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         var states = mutants
             .Select(mutant => new MutantWaveState(
                 mutant,
-                mutant.AssessingTests.GetIdentifiers().ToList()))
+                GetWaveTestIdentifiers(mutant)))
             .ToList();
         var stopwatch = Stopwatch.StartNew();
         var waveCount = 0;
@@ -532,6 +532,19 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             confirmationCount,
             stopwatch.ElapsedMilliseconds);
         return new TestRunResult(true);
+    }
+
+    private List<string> GetWaveTestIdentifiers(IMutant mutant)
+    {
+        if (!mutant.AssessingTests.IsEveryTest)
+        {
+            return mutant.AssessingTests.GetIdentifiers().ToList();
+        }
+
+        lock (_discoveryLock)
+        {
+            return _testDescriptions.Keys.ToList();
+        }
     }
 
     private async Task<MutationWaveOutcome> RunMutationWaveAsync(

@@ -54,18 +54,20 @@ public static class MutationBatchPlanner
             .Where(mutant => mutant.ResultStatus == MutantStatus.Pending)
             .ToList();
 
-        groups.AddRange(
-            remaining
-                .Where(mutant => mutant.AssessingTests.IsEveryTest)
-                .Select(mutant => new List<IMutant> { mutant }));
-        remaining.RemoveAll(mutant => mutant.AssessingTests.IsEveryTest);
-
         // Static and early-activation mutants require a fresh reload boundary, but disjoint
         // assessing sets may share that one fresh process. The activation map binds each test
         // to its mutant before its test lifecycle starts; disjoint coverage proves a test for one
         // mutant cannot initialize another packed mutant's static path. Keep isolation groups
         // separate from ordinary groups so a warm-host request never absorbs one accidentally.
-        groups.AddRange(PackDisjointMutants(remaining.Where(RequiresProcessIsolation)));
+        // An isolation mutant assessed by every test cannot share a fresh request because its set
+        // necessarily overlaps every sibling; it remains a singleton.
+        groups.AddRange(
+            remaining
+                .Where(mutant => RequiresProcessIsolation(mutant) && mutant.AssessingTests.IsEveryTest)
+                .Select(mutant => new List<IMutant> { mutant }));
+        groups.AddRange(PackDisjointMutants(
+            remaining.Where(mutant =>
+                RequiresProcessIsolation(mutant) && !mutant.AssessingTests.IsEveryTest)));
         remaining.RemoveAll(RequiresProcessIsolation);
 
         // Ordinary mutants may overlap because the MTP runner advances a batch in waves.

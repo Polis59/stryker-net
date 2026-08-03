@@ -74,6 +74,23 @@ public class MutationBatchPlannerTests
     }
 
     [TestMethod]
+    public void EveryTestOrdinaryMutantsShareWaveBatches()
+    {
+        var options = new Mock<IStrykerOptions>();
+        options.SetupGet(candidate => candidate.OptimizationMode)
+            .Returns(OptimizationModes.CoverageBasedTest);
+        options.SetupGet(candidate => candidate.Concurrency).Returns(1);
+        var mutants = Enumerable.Range(0, 4)
+            .Select(_ => CreateMutant(TestIdentifierList.EveryTest()))
+            .ToList();
+
+        var groups = MutationBatchPlanner.Build(options.Object, mutants).ToList();
+
+        groups.Count.ShouldBe(2);
+        groups.ShouldAllBe(group => group.Count == 2);
+    }
+
+    [TestMethod]
     public void DisjointIsolationMutantsShareOneFreshProcessGroup()
     {
         var options = new Mock<IStrykerOptions>();
