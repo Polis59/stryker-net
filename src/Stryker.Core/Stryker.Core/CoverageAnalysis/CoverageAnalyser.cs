@@ -169,11 +169,18 @@ public class CoverageAnalyser : ICoverageAnalyser
         }
 
         var testGuids = new List<string>();
+        var exactLifecycleTestGuids = new List<string>();
         foreach (var coverageRunResult in mutationToResultMap[mutantId])
         {
             testGuids.Add(coverageRunResult.TestId);
             // did this test covered the mutation via some static context?
             var mutationTestingRequirement = coverageRunResult[mutantId];
+            if (coverageRunResult.Confidence == CoverageConfidence.Exact &&
+                !mutationTestingRequirement.HasFlag(MutationTestingRequirements.NeedEarlyActivation) &&
+                !mutationTestingRequirement.HasFlag(MutationTestingRequirements.CoveredOutsideTest))
+            {
+                exactLifecycleTestGuids.Add(coverageRunResult.TestId);
+            }
             if (!resultingRequirements.HasFlag(MutationTestingRequirements.Static)
                 && (mutationTestingRequirement.HasFlag(MutationTestingRequirements.Static)
                     || mutationTestingRequirement.HasFlag(MutationTestingRequirements.CoveredOutsideTest)))
@@ -194,6 +201,18 @@ public class CoverageAnalyser : ICoverageAnalyser
             {
                 resultingRequirements |= MutationTestingRequirements.AgainstAllTests;
             }
+        }
+
+        // A lifecycle sink can observe the same mutation both between tests (for example while a
+        // fixture finishes) and inside a later complete test lifecycle. The exact in-lifecycle
+        // execution is sufficient to assess that mutant and can be activated before construction;
+        // retaining the outside-test flag would unnecessarily force a new process for every such
+        // mutant. Outside-only coverage still requires early activation and remains isolated.
+        if (exactLifecycleTestGuids.Count > 0 &&
+            resultingRequirements.HasFlag(MutationTestingRequirements.NeedEarlyActivation))
+        {
+            resultingRequirements &= ~MutationTestingRequirements.NeedEarlyActivation;
+            testGuids = exactLifecycleTestGuids;
         }
 
         return (resultingRequirements, new TestIdentifierList(testGuids));

@@ -1229,12 +1229,16 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                     .Concat(classOutsideTestMutants)
                     .Distinct()
                     .ToList();
+                var outsideOnlyMutants = classOutsideTestMutants
+                    .Except(snapshot.CoveredMutants)
+                    .Except(classStaticMutants)
+                    .ToList();
                 return (ICoverageRunResult)CoverageRunResult.Create(
                     test.Uid,
                     confidence,
                     coveredMutants,
                     classStaticMutants,
-                    classOutsideTestMutants);
+                    outsideOnlyMutants);
             })
             .ToList();
     }
