@@ -4,6 +4,7 @@ using System.IO.Pipes;
 using System.Linq;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Shouldly;
 using Stryker.Core.InjectedHelpers;
@@ -13,6 +14,29 @@ namespace Stryker.Core.UnitTest.InjectedHelpers;
 [TestClass]
 public class InjectedHelperTests : TestBase
 {
+    [TestMethod]
+    public void MutantControl_ShouldCacheFileActivationBetweenRequestRefreshes()
+    {
+        var codeInjection = new CodeInjection();
+        var source = codeInjection.MutantHelpers.Single(helper => helper.Key.EndsWith("MutantControl.cs", StringComparison.Ordinal)).Value;
+        var root = CSharpSyntaxTree.ParseText(source).GetRoot();
+        var control = root.DescendantNodes().OfType<ClassDeclarationSyntax>()
+            .Single(type => type.Identifier.ValueText == "MutantControl");
+
+        control.Members.OfType<FieldDeclarationSyntax>()
+            .ShouldContain(field => field.Declaration.Variables.Any(variable => variable.Identifier.ValueText == "_fileMutantValueCached"));
+
+        var refresh = control.Members.OfType<MethodDeclarationSyntax>()
+            .Single(method => method.Identifier.ValueText == "RefreshActiveMutantFromFile");
+        refresh.Modifiers.Any(modifier => modifier.IsKind(SyntaxKind.PublicKeyword)).ShouldBeTrue();
+        refresh.Modifiers.Any(modifier => modifier.IsKind(SyntaxKind.StaticKeyword)).ShouldBeTrue();
+        refresh.ToString().ShouldContain("_fileMutantValueCached = true");
+
+        var isActive = control.Members.OfType<MethodDeclarationSyntax>()
+            .Single(method => method.Identifier.ValueText == "IsActive");
+        isActive.ToString().ShouldContain("if (!_fileMutantValueCached)");
+    }
+
     [TestMethod]
     [DataRow(LanguageVersion.CSharp2)]
     [DataRow(LanguageVersion.CSharp3)]

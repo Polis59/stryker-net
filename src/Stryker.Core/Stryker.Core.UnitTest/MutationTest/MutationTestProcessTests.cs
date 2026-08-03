@@ -124,6 +124,7 @@ public class MutationTestProcessTests : TestBase
         var mutationExecutor = new MutationTestExecutor(loggerMock.Object);
         mutationExecutor.TestRunner = TestScenario.GetTestRunnerMock().Object;
         var coverageAnalyzer = new CoverageAnalyser(TestLoggerFactory.CreateLogger<CoverageAnalyser>());
+        var processLogger = TestLoggerFactory.CreateMockLogger<MutationTestProcess>();
 
         var options = new StrykerOptions()
         {
@@ -134,7 +135,7 @@ public class MutationTestProcessTests : TestBase
         Input.InitialTestRun = new InitialTestRun(TestScenario.GetInitialRunResult(), new TimeoutValueCalculator(500));
 
         var mutationProcessMock = Mock.Of<IMutationProcess>();
-        var target = new MutationTestProcess(mutationExecutor, coverageAnalyzer, mutationProcessMock, TestLoggerFactory.CreateLogger<MutationTestProcess>());
+        var target = new MutationTestProcess(mutationExecutor, coverageAnalyzer, mutationProcessMock, processLogger.Object);
 
         target.Initialize(Input, options, null);
         target.GetCoverage();
@@ -142,6 +143,13 @@ public class MutationTestProcessTests : TestBase
 
         TestScenario.GetMutantStatus(1).ShouldBe(MutantStatus.Survived);
         TestScenario.GetMutantStatus(2).ShouldBe(MutantStatus.NoCoverage);
+
+        var progress = processLogger.Invocations
+            .Where(invocation => invocation.Method.Name == nameof(ILogger.Log))
+            .Select(invocation => invocation.Arguments[2].ToString())
+            .ToList();
+        progress.ShouldContain(message => message.Contains("Mutation group started:") && message.Contains("group 1/1, mutants 1"));
+        progress.ShouldContain(message => message.Contains("Mutation group completed:") && message.Contains("completed groups 1/1, completed mutants 1/1"));
     }
 
     [TestMethod]

@@ -33,9 +33,14 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
     private readonly Dictionary<string, MtpTestDescription> _testDescriptions = new();
     private readonly object _discoveryLock = new();
     private readonly object _coverageCacheLock = new();
+    private readonly ConcurrentDictionary<string, Lazy<Task<bool>>> _discoveryCache =
+        new(StringComparer.Ordinal);
     private readonly Dictionary<
         CoverageConfidence,
         IReadOnlyList<ICoverageRunResult>> _perTestCoverageCache = [];
+    private readonly ConcurrentDictionary<string, Lazy<Task<ITestRunResult>>> _initialRunCache =
+        new(StringComparer.Ordinal);
+    private readonly SemaphoreSlim _initialRunGate = new(1, 1);
     private readonly ISingleRunnerFactory _runnerFactory;
     private readonly IStrykerOptions _options;
 
@@ -86,43 +91,71 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
             return false;
         }
 
-        return await RunThisAsync(runner => runner.DiscoverTestsAsync(assembly)).ConfigureAwait(false);
+        var path = Path.GetFullPath(assembly);
+        var candidate = new Lazy<Task<bool>>(
+            () => RunThisAsync(runner => runner.DiscoverTestsAsync(path)),
+            LazyThreadSafetyMode.ExecutionAndPublication);
+        var discovery = _discoveryCache.GetOrAdd(path, candidate);
+        if (!ReferenceEquals(discovery, candidate))
+        {
+            _logger.LogInformation("Reusing test discovery for {TestAssembly}", path);
+        }
+
+        return await discovery.Value.ConfigureAwait(false);
     }
 
     public ITestSet GetTests(IProjectAndTests project) => _testSet;
 
-    // Solution mode runs one initial suite pass per mutated project, and those projects
-    // commonly share a single test assembly. Concurrent initial passes oversubscribe the
-    // machine (each host parallelizes to the core count on its own), which flakes
-    // timing-sensitive tests and inflates the baseline durations that size every later
-    // timeout budget. One initial pass at a time costs little wall clock - the passes
-    // were slowing each other down - and produces honest baselines. Static: the gate
-    // spans the per-project pools of one solution run.
-    private static readonly SemaphoreSlim InitialRunGate = new(1, 1);
-
     public async Task<ITestRunResult> InitialTestAsync(IProjectAndTests project)
     {
-        var assemblies = project.GetTestAssemblies();
+        var assemblies = project.GetTestAssemblies()
+            .Select(Path.GetFullPath)
+            .OrderBy(path => path, StringComparer.Ordinal)
+            .ToArray();
         if (!assemblies.Any())
         {
             return new TestRunResult(false, "No test assemblies found");
         }
 
-        await InitialRunGate.WaitAsync().ConfigureAwait(false);
-        ITestRunResult results;
+        // Solution mode asks for one initial run per mutated project even when those
+        // projects share the same test assemblies. The unmutated baseline and its
+        // measured durations are properties of that exact assembly set, not of the
+        // source project Stryker happens to be initializing. Share one task so
+        // concurrent project initialization pays for the suite once. Different test
+        // assembly sets remain serialized because each suite already parallelizes
+        // internally and running them together oversubscribes the machine.
+        var key = string.Join('\n', assemblies);
+        var candidate = new Lazy<Task<ITestRunResult>>(
+            () => RunInitialTestAsync(project),
+            LazyThreadSafetyMode.ExecutionAndPublication);
+        var initialRun = _initialRunCache.GetOrAdd(key, candidate);
+        if (!ReferenceEquals(initialRun, candidate))
+        {
+            _logger.LogInformation(
+                "Reusing the initial test run for {AssemblyCount} shared test assemblies",
+                assemblies.Length);
+        }
+
+        return await initialRun.Value.ConfigureAwait(false);
+    }
+
+    private async Task<ITestRunResult> RunInitialTestAsync(IProjectAndTests project)
+    {
+        await _initialRunGate.WaitAsync().ConfigureAwait(false);
         try
         {
-            results = await RunThisAsync(runner => runner.InitialTestAsync(project)).ConfigureAwait(false);
+            var results = await RunThisAsync(runner => runner.InitialTestAsync(project)).ConfigureAwait(false);
+
+            // Reset once after the shared baseline. Every project awaiting this task
+            // receives the same complete result after the reset has finished.
+            ResetTestProcesses();
+
+            return results;
         }
         finally
         {
-            InitialRunGate.Release();
+            _initialRunGate.Release();
         }
-
-        // reset all test processes after the initial test run
-        ResetTestProcesses();
-
-        return results;
     }
 
     public IEnumerable<ICoverageRunResult> CaptureCoverage(IProjectAndTests project)
@@ -367,5 +400,6 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
             runner.Dispose();
         }
         _runnerAvailable.Dispose();
+        _initialRunGate.Dispose();
     }
 }
