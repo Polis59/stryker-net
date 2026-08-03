@@ -219,63 +219,72 @@ internal sealed class AssemblyTestServer : IDisposable
                 }
             });
 
-            ResponseListener executeTestsResponse;
             try
             {
-                // The RPC call itself can block when the server is stuck (e.g. infinite loop in mutated code)
-                executeTestsResponse = await _client.RunTestsAsync(runId, onUpdate, testsToRun, timeout.Value, bailSource.Token)
-                    .WaitAsync(timeout.Value).ConfigureAwait(false);
-            }
-            catch (TimeoutException ex)
-            {
-                _logger.LogDebug(ex, "{RunnerId}: Test run RPC call timed out for {Assembly}", _runnerId, _assembly);
-                return (testResults.ToList(), true);
-            }
-            catch (OperationCanceledException) when (bailed)
-            {
-                return (testResults.ToList(), false);
-            }
-            catch (OperationCanceledException ex) when (stalled)
-            {
-                _logger.LogDebug(ex, "{RunnerId}: Test run cancelled after stalling for {Assembly}", _runnerId, _assembly);
-                return (testResults.ToList(), true);
-            }
-            catch (OperationCanceledException ex)
-            {
-                // The client's backstop cancellation window expired. That is a timeout verdict,
-                // not a crash: reporting it as an exception would route the batch through the
-                // crash-retry path and burn the whole budget a second time.
-                _logger.LogDebug(ex, "{RunnerId}: Test run RPC call was cancelled by its backstop window for {Assembly}", _runnerId, _assembly);
-                return (testResults.ToList(), true);
-            }
+                ResponseListener executeTestsResponse;
+                try
+                {
+                    // The RPC implementation can ignore request cancellation while a mutated
+                    // host is wedged. Apply the same token to the local wait so bail and stall
+                    // decisions return immediately instead of burning the entire session budget.
+                    executeTestsResponse = await _client.RunTestsAsync(runId, onUpdate, testsToRun, timeout.Value, bailSource.Token)
+                        .WaitAsync(timeout.Value, bailSource.Token).ConfigureAwait(false);
+                }
+                catch (TimeoutException ex)
+                {
+                    _logger.LogDebug(ex, "{RunnerId}: Test run RPC call timed out for {Assembly}", _runnerId, _assembly);
+                    return (testResults.ToList(), true);
+                }
+                catch (OperationCanceledException) when (bailed)
+                {
+                    return (testResults.ToList(), false);
+                }
+                catch (OperationCanceledException ex) when (stalled)
+                {
+                    _logger.LogDebug(ex, "{RunnerId}: Test run cancelled after stalling for {Assembly}", _runnerId, _assembly);
+                    return (testResults.ToList(), true);
+                }
+                catch (OperationCanceledException ex)
+                {
+                    // The client's backstop cancellation window expired. That is a timeout verdict,
+                    // not a crash: reporting it as an exception would route the batch through the
+                    // crash-retry path and burn the whole budget a second time.
+                    _logger.LogDebug(ex, "{RunnerId}: Test run RPC call was cancelled by its backstop window for {Assembly}", _runnerId, _assembly);
+                    return (testResults.ToList(), true);
+                }
 
-            var completionTask = executeTestsResponse.WaitCompletionAsync(timeout.Value, bailSource.Token);
-            await Task.WhenAny(completionTask, HostExitAsync()).ConfigureAwait(false);
-            if (bailed)
-            {
-                return (testResults.ToList(), false);
-            }
+                var completionTask = executeTestsResponse.WaitCompletionAsync(timeout.Value, bailSource.Token);
+                await Task.WhenAny(completionTask, HostExitAsync()).ConfigureAwait(false);
+                if (bailed)
+                {
+                    return (testResults.ToList(), false);
+                }
 
-            if (stalled)
-            {
-                return (testResults.ToList(), true);
-            }
+                if (stalled)
+                {
+                    return (testResults.ToList(), true);
+                }
 
-            ThrowIfHostCrashed(completionTask);
+                ThrowIfHostCrashed(completionTask);
 
-            bool completed;
-            try
-            {
-                completed = await completionTask.ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (stalled)
-            {
-                return (testResults.ToList(), true);
-            }
+                bool completed;
+                try
+                {
+                    completed = await completionTask.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (stalled)
+                {
+                    return (testResults.ToList(), true);
+                }
 
-            _logger.LogInformation("{RunnerId}: RUNSTAGE firstUpdateMs={FirstUpdate} totalMs={Total} results={Results}",
-                _runnerId, firstUpdateMs, stageStopwatch.ElapsedMilliseconds, testResults.Count);
-            return (testResults.ToList(), !completed);
+                _logger.LogInformation("{RunnerId}: RUNSTAGE firstUpdateMs={FirstUpdate} totalMs={Total} results={Results}",
+                    _runnerId, firstUpdateMs, stageStopwatch.ElapsedMilliseconds, testResults.Count);
+                return (testResults.ToList(), !completed);
+            }
+            finally
+            {
+                await stallMonitorSource.CancelAsync().ConfigureAwait(false);
+            }
         }
 
         ResponseListener response;
