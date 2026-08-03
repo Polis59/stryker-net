@@ -312,6 +312,15 @@ namespace Stryker
         /// </summary>
         public static void RefreshActiveMutantFromFile()
         {
+            // The framework calls this on the request execution context before xUnit starts
+            // tests. Clear any unbound probe inherited by that context so each new test can
+            // establish its own parallel assignment. A test's child/background work retains
+            // the assignment it inherited from that test.
+            if (_parallelMemo != null)
+            {
+                _parallelMemo.Value = null;
+            }
+
             int fileMutantId;
             if (TryReadMutantFromFile(out fileMutantId))
             {
@@ -357,17 +366,15 @@ namespace Stryker
                 return false;
             }
 
-            // Fast path: a binding memoized earlier in this execution context. The memo was
-            // created inside the current test's async flow, so it cannot leak across tests.
+            // Fast path: a binding memoized earlier in this execution context. The assignment
+            // belongs to the test flow, not to the mutable request file. Child/background work
+            // can outlive the request that created it and must retain that assignment instead of
+            // resolving its old xUnit TestContext against a later request's map.
             object[] memo = _parallelMemo.Value;
             if (memo != null)
             {
-                string memoHeader = (string)memo[0];
-                if (string.Equals(memoHeader, _parallelHeader, System.StringComparison.Ordinal))
-                {
-                    mutantId = (int)memo[1];
-                    return true;
-                }
+                mutantId = (int)memo[1];
+                return true;
             }
 
             if (System.Environment.TickCount64 < System.Threading.Interlocked.Read(ref _parallelNegativeUntilTicks))
