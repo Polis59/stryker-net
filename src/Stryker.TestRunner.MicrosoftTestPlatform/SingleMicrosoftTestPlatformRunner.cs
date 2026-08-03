@@ -1755,32 +1755,14 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             // through the published map.
             WriteMutantIdToFile(mutantId);
 
-            if (packedAssignments is { Count: > 0 } && mutants is { Count: > 0 } && bailPredicate is null)
+            // MTP acknowledges request cancellation before its test scheduler has necessarily
+            // drained. Replacing the map at that point lets leftover tests observe the next
+            // request's assignments. Packed waves are capped at 64 tests, so they finish their
+            // bounded request and preserve the activation-map boundary instead of bailing.
+            if (packedAssignments is { Count: > 0 } && bailPredicate is not null)
             {
-                // Bail with stock's exact semantics: cancel the request the moment every
-                // mutant of the session has a verdict. A killing test resolves its assigned
-                // mutant; when the set of unresolved mutants empties, the remaining mapped
-                // tests prove nothing. A session containing a true survivor never bails.
-                var unresolved = new HashSet<int>(mutants.Select(m => m.Id));
-                var bailLock = new object();
-                bailPredicate = update =>
-                {
-                    if (update.Node.ExecutionState is not (TestNodeStates.Failed or TestNodeStates.Error or TestNodeStates.TimedOut))
-                    {
-                        return false;
-                    }
-
-                    if (!packedAssignments.TryGetValue(update.Node.Uid, out var ownerId))
-                    {
-                        return false;
-                    }
-
-                    lock (bailLock)
-                    {
-                        unresolved.Remove(ownerId);
-                        return unresolved.Count == 0;
-                    }
-                };
+                throw new InvalidOperationException(
+                    "A packed MTP request must finish before its activation map can be replaced.");
             }
 
             var accumulator = new TestRunAccumulator();
