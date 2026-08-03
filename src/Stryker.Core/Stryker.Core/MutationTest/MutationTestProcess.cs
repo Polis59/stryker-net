@@ -90,6 +90,14 @@ public class MutationTestProcess : IMutationTestProcess
             TestRunner.MicrosoftTestPlatform.MutationBatchPlanner.RequiresBroadSessionLimit);
         var packedGroups = mutantGroups.Where(group => group.Count > 1).ToList();
         var totalMutantCount = mutantGroups.Sum(group => group.Count);
+        var staticMutantCount = mutantGroups
+            .SelectMany(group => group)
+            .Count(mutant => mutant.IsStaticValue);
+        var earlyActivationMutantCount = mutantGroups
+            .SelectMany(group => group)
+            .Count(mutant => mutant.MustBeTestedInIsolation);
+        var isolatedGroupCount = mutantGroups.Count(group =>
+            group.Any(mutant => mutant.IsStaticValue || mutant.MustBeTestedInIsolation));
         var projectFilePath = Input.SourceProjectInfo.AnalyzerResult.ProjectFilePath;
         var indexedGroups = mutantGroups
             .Select((mutants, index) => (Index: index + 1, Mutants: mutants))
@@ -100,12 +108,17 @@ public class MutationTestProcess : IMutationTestProcess
         _logger.LogInformation(
             "Mutation execution plan: {MutantCount} mutants in {GroupCount} groups; " +
             "{BroadGroupCount} broad singletons, {PackedGroupCount} packed groups, " +
-            "largest packed group {LargestPackedGroupCount}",
+            "largest packed group {LargestPackedGroupCount}; " +
+            "{StaticMutantCount} static mutants, {EarlyActivationMutantCount} early-activation mutants, " +
+            "{IsolatedGroupCount} isolation groups",
             totalMutantCount,
             mutantGroups.Count,
             broadGroupCount,
             packedGroups.Count,
-            packedGroups.Count == 0 ? 0 : packedGroups.Max(group => group.Count));
+            packedGroups.Count == 0 ? 0 : packedGroups.Max(group => group.Count),
+            staticMutantCount,
+            earlyActivationMutantCount,
+            isolatedGroupCount);
 
         await MutationWorkLaneScheduler.RunAsync(
             indexedGroups,
