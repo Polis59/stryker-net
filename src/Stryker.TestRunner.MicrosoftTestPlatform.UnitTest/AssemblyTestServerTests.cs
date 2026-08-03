@@ -414,6 +414,41 @@ public class AssemblyTestServerTests
     }
 
     [TestMethod]
+    public async Task RunTestsAsync_WithTimeout_ShouldPreserveTheRunningTestIdentity()
+    {
+        SetupSuccessfulConnection();
+
+        var running = new TestNodeUpdate(
+            new TestNode("uid-1", "Test1", "action", TestNodeStates.InProgress),
+            "parent");
+        _clientMock
+            .Setup(c => c.RunTestsAsync(
+                It.IsAny<Guid>(),
+                It.IsAny<Func<TestNodeUpdate[], Task>>(),
+                null,
+                It.IsAny<TimeSpan?>(),
+                It.IsAny<CancellationToken>()))
+            .Returns<Guid, Func<TestNodeUpdate[], Task>, TestNode[]?, TimeSpan?, CancellationToken>(
+                async (id, callback, _, _, _) =>
+                {
+                    await callback([running]);
+                    return new TestNodeUpdatesResponseListener(id, _ => Task.CompletedTask);
+                });
+
+        using var server = CreateServer();
+        await server.StartAsync();
+        var (results, timedOut) = await server.RunTestsAsync(
+            null,
+            TimeSpan.FromMilliseconds(50),
+            stallDetection: false);
+
+        timedOut.ShouldBeTrue();
+        results.ShouldContain(update =>
+            update.Node.Uid == "uid-1" &&
+            update.Node.ExecutionState == TestNodeStates.TimedOut);
+    }
+
+    [TestMethod]
     public async Task RunTestsAsync_WithTimeout_ShouldThrowTestHostCrashed_WhenProcessExitsDuringRun()
     {
         SetupSuccessfulConnection();

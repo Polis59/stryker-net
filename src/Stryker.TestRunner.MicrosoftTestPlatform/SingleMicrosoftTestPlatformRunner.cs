@@ -450,9 +450,15 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                     state.Failed.UnionWith(failed);
                     state.Unresolved = false;
                 }
+
+                if (outcome.TimedOutByMutant.TryGetValue(state.Mutant.Id, out var timedOut) && timedOut.Count > 0)
+                {
+                    state.TimedOut.UnionWith(timedOut);
+                    state.Unresolved = false;
+                }
             }
 
-            if (outcome.HadRuntimeIssue || outcome.TimedOut)
+            if (outcome.HadRuntimeIssue)
             {
                 break;
             }
@@ -512,14 +518,15 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         {
             var executed = new TestIdentifierList(state.Executed);
             var failed = new TestIdentifierList(state.Failed);
-            update?.Invoke([state.Mutant], failed, executed, TestIdentifierList.NoTest());
+            var timedOut = new TestIdentifierList(state.TimedOut);
+            update?.Invoke([state.Mutant], failed, executed, timedOut);
             if (update is null)
             {
                 state.Mutant.AnalyzeTestRun(
                     failed,
                     executed,
-                    TestIdentifierList.NoTest(),
-                    sessionTimedOut: false,
+                    timedOut,
+                    sessionTimedOut: state.TimedOut.Count > 0,
                     sessionRuntimeError: false);
             }
         }
@@ -621,6 +628,14 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 }
             }
 
+            foreach (var testUid in result.TimedOutTests.GetIdentifiers())
+            {
+                if (requestedAssignments.TryGetValue(testUid, out var mutantId))
+                {
+                    AddToBucket(outcome.TimedOutByMutant, mutantId, testUid);
+                }
+            }
+
             return outcome;
         }
         finally
@@ -649,6 +664,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         public List<string> Remaining { get; } = remaining;
         public HashSet<string> Executed { get; } = new(StringComparer.Ordinal);
         public HashSet<string> Failed { get; } = new(StringComparer.Ordinal);
+        public HashSet<string> TimedOut { get; } = new(StringComparer.Ordinal);
         public bool Unresolved { get; set; } = true;
         public bool Reported { get; set; }
     }
@@ -657,6 +673,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     {
         public Dictionary<int, HashSet<string>> ExecutedByMutant { get; } = [];
         public Dictionary<int, HashSet<string>> FailedByMutant { get; } = [];
+        public Dictionary<int, HashSet<string>> TimedOutByMutant { get; } = [];
         public bool TimedOut { get; set; }
         public bool HadRuntimeIssue { get; set; }
     }

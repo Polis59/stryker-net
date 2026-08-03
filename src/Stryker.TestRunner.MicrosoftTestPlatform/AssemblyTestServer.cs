@@ -233,7 +233,7 @@ internal sealed class AssemblyTestServer : IDisposable
                 catch (TimeoutException ex)
                 {
                     _logger.LogDebug(ex, "{RunnerId}: Test run RPC call timed out for {Assembly}", _runnerId, _assembly);
-                    return (testResults.ToList(), true);
+                    return (MarkRunningTestsTimedOut(testResults), true);
                 }
                 catch (OperationCanceledException) when (bailed)
                 {
@@ -242,7 +242,7 @@ internal sealed class AssemblyTestServer : IDisposable
                 catch (OperationCanceledException ex) when (stalled)
                 {
                     _logger.LogDebug(ex, "{RunnerId}: Test run cancelled after stalling for {Assembly}", _runnerId, _assembly);
-                    return (testResults.ToList(), true);
+                    return (MarkRunningTestsTimedOut(testResults), true);
                 }
                 catch (OperationCanceledException ex)
                 {
@@ -250,7 +250,7 @@ internal sealed class AssemblyTestServer : IDisposable
                     // not a crash: reporting it as an exception would route the batch through the
                     // crash-retry path and burn the whole budget a second time.
                     _logger.LogDebug(ex, "{RunnerId}: Test run RPC call was cancelled by its backstop window for {Assembly}", _runnerId, _assembly);
-                    return (testResults.ToList(), true);
+                    return (MarkRunningTestsTimedOut(testResults), true);
                 }
 
                 var completionTask = executeTestsResponse.WaitCompletionAsync(timeout.Value, bailSource.Token);
@@ -262,7 +262,7 @@ internal sealed class AssemblyTestServer : IDisposable
 
                 if (stalled)
                 {
-                    return (testResults.ToList(), true);
+                    return (MarkRunningTestsTimedOut(testResults), true);
                 }
 
                 ThrowIfHostCrashed(completionTask);
@@ -274,12 +274,14 @@ internal sealed class AssemblyTestServer : IDisposable
                 }
                 catch (OperationCanceledException) when (stalled)
                 {
-                    return (testResults.ToList(), true);
+                    return (MarkRunningTestsTimedOut(testResults), true);
                 }
 
                 _logger.LogInformation("{RunnerId}: RUNSTAGE firstUpdateMs={FirstUpdate} totalMs={Total} results={Results}",
                     _runnerId, firstUpdateMs, stageStopwatch.ElapsedMilliseconds, testResults.Count);
-                return (testResults.ToList(), !completed);
+                return completed
+                    ? (testResults.ToList(), false)
+                    : (MarkRunningTestsTimedOut(testResults), true);
             }
             finally
             {
@@ -310,6 +312,30 @@ internal sealed class AssemblyTestServer : IDisposable
         _logger.LogInformation("{RunnerId}: RUNSTAGE firstUpdateMs={FirstUpdate} totalMs={Total} results={Results}",
             _runnerId, firstUpdateMs, stageStopwatch.ElapsedMilliseconds, testResults.Count);
         return (testResults.ToList(), false);
+    }
+
+    private static List<TestNodeUpdate> MarkRunningTestsTimedOut(
+        IEnumerable<TestNodeUpdate> updates)
+    {
+        var snapshot = updates.ToList();
+        var finishedTestIds = snapshot
+            .Where(update => TestNodeStates.IsFinished(update.Node.ExecutionState))
+            .Select(update => update.Node.Uid)
+            .ToHashSet(StringComparer.Ordinal);
+
+        foreach (var running in snapshot
+                     .Where(update => update.Node.ExecutionState == TestNodeStates.InProgress)
+                     .GroupBy(update => update.Node.Uid, StringComparer.Ordinal)
+                     .Where(group => !finishedTestIds.Contains(group.Key))
+                     .Select(group => group.First()))
+        {
+            snapshot.Add(running with
+            {
+                Node = running.Node with { ExecutionState = TestNodeStates.TimedOut },
+            });
+        }
+
+        return snapshot;
     }
 
     /// <summary>
