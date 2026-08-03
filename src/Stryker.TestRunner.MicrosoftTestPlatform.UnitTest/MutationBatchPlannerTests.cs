@@ -57,6 +57,44 @@ public class MutationBatchPlannerTests
     }
 
     [TestMethod]
+    public void LargeWaveBatchesAreCappedSoWorkersCanStealTheTail()
+    {
+        var options = new Mock<IStrykerOptions>();
+        options.SetupGet(candidate => candidate.OptimizationMode)
+            .Returns(OptimizationModes.CoverageBasedTest);
+        options.SetupGet(candidate => candidate.Concurrency).Returns(4);
+        var mutants = Enumerable.Range(0, 1_000)
+            .Select(index => CreateMutant(new TestIdentifierList($"test-{index}")))
+            .ToList();
+
+        var groups = MutationBatchPlanner.Build(options.Object, mutants).ToList();
+
+        groups.Sum(group => group.Count).ShouldBe(mutants.Count);
+        groups.Count.ShouldBe(32);
+        groups.Max(group => group.Count).ShouldBe(32);
+    }
+
+    [TestMethod]
+    public void MutantsSharingAProfiledKillerAreStripedAcrossGroups()
+    {
+        var shared = Enumerable.Range(0, 8)
+            .Select(index => CreateMutant(new TestIdentifierList($"shared-{index}")))
+            .ToList();
+        var unprofiled = Enumerable.Range(0, 8)
+            .Select(index => CreateMutant(new TestIdentifierList($"other-{index}")))
+            .ToList();
+
+        var groups = MutationBatchPlanner.DistributeOrdinaryMutants(
+            [.. shared, .. unprofiled],
+            groupCount: 4,
+            mutant => shared.Contains(mutant) ? "same-killer" : null);
+
+        groups.Count.ShouldBe(4);
+        groups.ShouldAllBe(group => group.Count == 4);
+        groups.ShouldAllBe(group => group.Count(shared.Contains) == 2);
+    }
+
+    [TestMethod]
     public void OverlappingOrdinaryMutantsShareWaveBatches()
     {
         var options = new Mock<IStrykerOptions>();

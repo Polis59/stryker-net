@@ -37,7 +37,24 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\Stryker.Core\Stryker.Core\Stryker.Core.csproj" />
+    <!-- Built for its output only: the MTP runner spawns the collectible isolation broker from
+         an `isolation-host` folder beside its own assembly (see CollectibleTestIsolationClient),
+         so the host must not merge into the CLI's dependency closure. -->
+    <ProjectReference Include="..\..\Stryker.TestIsolationHost\Stryker.TestIsolationHost.csproj"
+                      ReferenceOutputAssembly="false"
+                      Private="false"
+                      SkipGetTargetFrameworkProperties="true" />
   </ItemGroup>
+
+  <Target Name="CopyIsolationHostPayload" AfterTargets="Build">
+    <ItemGroup>
+      <IsolationHostPayload Include="..\..\Stryker.TestIsolationHost\bin\$(Configuration)\net10.0\**\*" />
+    </ItemGroup>
+    <Copy
+      SourceFiles="@(IsolationHostPayload)"
+      DestinationFiles="@(IsolationHostPayload->'$(OutDir)isolation-host\%(RecursiveDir)%(Filename)%(Extension)')"
+      SkipUnchangedFiles="true" />
+  </Target>
 
   <ItemGroup>
     <None Include="..\..\..\LICENSE" Pack="true" PackagePath="" Visible="false" />

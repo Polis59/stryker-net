@@ -165,10 +165,43 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
             var confidence = _options.OptimizationMode.HasFlag(OptimizationModes.CaptureCoveragePerTest)
                 ? CoverageConfidence.Exact
                 : CoverageConfidence.Normal;
-            return CaptureCoverageTestByTest(project, confidence);
+            try
+            {
+                return CaptureCoverageTestByTest(project, confidence);
+            }
+            catch (Exception exception) when (IsCoverageLifecycleSinkUnavailable(exception))
+            {
+                // Exact class-bounded coverage is an optional protocol supplied by a cooperating
+                // xUnit test assembly. Stock xUnit projects do not install that lifecycle sink.
+                // Fall back to Stryker's conservative aggregate coverage: every covered mutant is
+                // assigned to every test, which preserves correctness at the cost of wider test
+                // selections during the mutation phase.
+                _logger.LogWarning(
+                    "The test assembly does not provide the xUnit coverage lifecycle sink; " +
+                    "falling back to conservative aggregate coverage.");
+                return CaptureCoverageInOneGo(project);
+            }
         }
 
         return CaptureCoverageInOneGo(project);
+    }
+
+    internal static bool IsCoverageLifecycleSinkUnavailable(Exception exception)
+    {
+        if (exception is CoverageLifecycleSinkUnavailableException)
+        {
+            return true;
+        }
+
+        if (exception is AggregateException aggregate)
+        {
+            var innerExceptions = aggregate.Flatten().InnerExceptions;
+            return innerExceptions.Count > 0 &&
+                innerExceptions.All(IsCoverageLifecycleSinkUnavailable);
+        }
+
+        return exception.InnerException is not null &&
+            IsCoverageLifecycleSinkUnavailable(exception.InnerException);
     }
 
     private IEnumerable<ICoverageRunResult> CaptureCoverageInOneGo(IProjectAndTests project)
@@ -178,7 +211,7 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
         // Enable coverage mode on all runners
         foreach (var runner in _allRunners)
         {
-            runner.SetCoverageMode(true);
+            runner.SetCoverageMode(true, perTest: false);
         }
 
         try

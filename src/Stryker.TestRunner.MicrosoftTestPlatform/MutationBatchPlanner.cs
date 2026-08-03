@@ -20,6 +20,7 @@ public static class MutationBatchPlanner
     /// </summary>
     private const int MaximumSerialSessionTests = 256;
     private const int MaximumMutantsPerPackedSession = 16;
+    private const int MaximumMutantsPerOrdinaryWaveBatch = 32;
 
     /// <summary>
     /// Returns whether a planned group should use the broad-session concurrency gate.
@@ -72,19 +73,87 @@ public static class MutationBatchPlanner
 
         // Ordinary mutants may overlap because the MTP runner advances a batch in waves.
         // A test contested by several mutants is assigned to one of them in the current wave
-        // and remains available to the others in later waves. Chunking by twice the worker
-        // count keeps every worker fed without creating thousands of fixture-paying groups.
+        // and remains available to the others in later waves. Keep at least twice as many
+        // groups as workers, but cap each group so one coverage-heavy batch cannot retain a
+        // worker for the rest of the campaign while the other workers drain and go idle.
         if (remaining.Count > 0)
         {
-            var chunkCount = Math.Min(
-                remaining.Count,
-                Math.Max(1, options.Concurrency) * 2);
-            var chunkSize = (remaining.Count + chunkCount - 1) / chunkCount;
-            groups.AddRange(remaining.Chunk(chunkSize).Select(chunk => chunk.ToList()));
+            var chunkCount = Math.Min(remaining.Count, Math.Max(
+                Math.Max(1, options.Concurrency) * 2,
+                (remaining.Count + MaximumMutantsPerOrdinaryWaveBatch - 1) /
+                MaximumMutantsPerOrdinaryWaveBatch));
+            var mutationPriorities = SingleMicrosoftTestPlatformRunner
+                .LoadIsolationMutationPriorities(Environment.GetEnvironmentVariable(
+                    SingleMicrosoftTestPlatformRunner.IsolationMutationProfileFileVariable));
+            string? SelectKillerFamily(IMutant mutant)
+            {
+                if (mutationPriorities.Count == 0)
+                {
+                    return null;
+                }
+
+                return mutationPriorities.TryGetValue(
+                    SingleMicrosoftTestPlatformRunner.BuildMutationProfileKey(mutant),
+                    out var priorities)
+                    ? priorities.MaxBy(priority => priority.Value).Key
+                    : null;
+            }
+            groups.AddRange(DistributeOrdinaryMutants(
+                remaining,
+                chunkCount,
+                SelectKillerFamily));
         }
 
         ReportPlan(groups);
         return groups;
+    }
+
+    internal static IReadOnlyList<List<IMutant>> DistributeOrdinaryMutants(
+        IReadOnlyCollection<IMutant> mutants,
+        int groupCount,
+        Func<IMutant, string?> killerFamilySelector)
+    {
+        if (groupCount <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(groupCount));
+        }
+
+        var buckets = Enumerable.Range(0, Math.Min(groupCount, mutants.Count))
+            .Select(_ => new List<IMutant>())
+            .ToList();
+        var killerFamilies = buckets
+            .Select(_ => new HashSet<string>(StringComparer.Ordinal))
+            .ToList();
+        var targetSize = (mutants.Count + buckets.Count - 1) / buckets.Count;
+        var candidates = mutants
+            .Select(mutant => (Mutant: mutant, Killer: killerFamilySelector(mutant)))
+            .OrderBy(candidate => candidate.Killer is null)
+            .ThenBy(candidate => candidate.Killer, StringComparer.Ordinal)
+            .ThenBy(candidate => candidate.Mutant.Id)
+            .ToList();
+
+        foreach (var candidate in candidates)
+        {
+            var available = Enumerable.Range(0, buckets.Count)
+                .Where(index => buckets[index].Count < targetSize)
+                .ToList();
+            var withoutSameKiller = candidate.Killer is null
+                ? available
+                : available
+                    .Where(index => !killerFamilies[index].Contains(candidate.Killer))
+                    .ToList();
+            var target = (withoutSameKiller.Count > 0 ? withoutSameKiller : available)
+                .OrderBy(index => buckets[index].Count)
+                .ThenBy(index => index)
+                .First();
+            buckets[target].Add(candidate.Mutant);
+            if (candidate.Killer is not null)
+            {
+                killerFamilies[target].Add(candidate.Killer);
+            }
+        }
+
+        return buckets;
     }
 
     private static IEnumerable<List<IMutant>> PackDisjointMutants(IEnumerable<IMutant> candidates)

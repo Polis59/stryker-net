@@ -15,6 +15,21 @@ namespace Stryker.TestRunner.MicrosoftTestPlatform.UnitTest;
 public class MicrosoftTestPlatformRunnerPoolTests : TestBase
 {
     [TestMethod]
+    public void CoverageFallback_RecognizesOnlyLifecycleSinkFailures()
+    {
+        var unavailable = new CoverageLifecycleSinkUnavailableException("missing");
+
+        MicrosoftTestPlatformRunnerPool.IsCoverageLifecycleSinkUnavailable(unavailable)
+            .ShouldBeTrue();
+        MicrosoftTestPlatformRunnerPool.IsCoverageLifecycleSinkUnavailable(
+                new InvalidDataException("capture failed", unavailable))
+            .ShouldBeTrue();
+        MicrosoftTestPlatformRunnerPool.IsCoverageLifecycleSinkUnavailable(
+                new AggregateException(unavailable, new InvalidOperationException("other")))
+            .ShouldBeFalse();
+    }
+
+    [TestMethod]
     public async Task DiscoverTestsAsync_ReusesOneRunForSharedTestAssembly()
     {
         var discoveryStarted = new TaskCompletionSource(

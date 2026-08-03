@@ -1,5 +1,8 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO.MemoryMappedFiles;
+using System.Security.Cryptography;
+using System.Text;
 using Microsoft.Extensions.Logging;
 using Stryker.Abstractions;
 using Stryker.Abstractions.Options;
@@ -10,6 +13,9 @@ using Stryker.TestRunner.Tests;
 using static Stryker.Abstractions.Testing.ITestRunner;
 
 namespace Stryker.TestRunner.MicrosoftTestPlatform;
+
+internal sealed class CoverageLifecycleSinkUnavailableException(string message)
+    : Exception(message);
 
 /// <summary>
 /// Individual test runner instance that handles test execution with mutation-specific
@@ -24,6 +30,15 @@ namespace Stryker.TestRunner.MicrosoftTestPlatform;
 public class SingleMicrosoftTestPlatformRunner : IDisposable
 {
     private const int MaximumWaveAssignments = 64;
+    private const int InitialFreshProcessPriorityTests = 8;
+    private const string IsolationTestPriorityFileVariable =
+        "STRYKER_MTP_ISOLATION_TEST_PRIORITY_FILE";
+    internal const string IsolationMutationProfileFileVariable =
+        "STRYKER_MTP_ISOLATION_MUTATION_PROFILE_FILE";
+    private static readonly ConcurrentDictionary<string, int> IsolationKillHistory =
+        new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, byte> OrdinaryTimeoutHistory =
+        new(StringComparer.Ordinal);
     private const string InactiveMutantMapHeader = "stryker-mtp-activation-map-v1\toff";
     // Parallel multiplexed sessions: the injected MutantControl resolves each test's assigned
     // mutant through xUnit's ambient TestContext and acknowledges this map itself, so a
@@ -44,14 +59,19 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     private readonly string _activeTestJournalFilePath;
     private readonly string _coverageFilePath;
     private readonly string _coverageMapFilePath;
+    private readonly IReadOnlyDictionary<string, int> _configuredIsolationPriorities;
+    private readonly IReadOnlyDictionary<string, IReadOnlyDictionary<string, int>>
+        _configuredIsolationMutationPriorities;
     private readonly IStrykerOptions? _options;
 
     private string? _expectedMutantMapAcknowledgement;
 
     private readonly Dictionary<string, AssemblyTestServer> _assemblyServers = new();
+    private readonly Dictionary<string, CollectibleTestIsolationClient> _isolationClients = new();
     private readonly object _serverLock = new();
     private bool _disposed;
     private bool _coverageMode;
+    private bool _perTestCoverageMode;
 
     private string RunnerId => $"MtpRunner-{_id}";
     internal string MutantFilePath => _mutantFilePath;
@@ -78,6 +98,10 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         _discoveryLock = discoveryLock;
         _logger = logger;
         _options = options;
+        _configuredIsolationPriorities = LoadIsolationTestPriorities(
+            Environment.GetEnvironmentVariable(IsolationTestPriorityFileVariable));
+        _configuredIsolationMutationPriorities = LoadIsolationMutationPriorities(
+            Environment.GetEnvironmentVariable(IsolationMutationProfileFileVariable));
 
         // Stryker can create one runner pool per solution project. A pool-local
         // numeric ID would let concurrent projects overwrite each other's
@@ -401,9 +425,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         ITimeoutValueCalculator? timeoutCalc)
     {
         var states = mutants
-            .Select(mutant => new MutantWaveState(
-                mutant,
-                GetWaveTestIdentifiers(mutant)))
+            .Select(CreateMutantWaveState)
             .ToList();
         var stopwatch = Stopwatch.StartNew();
         var waveCount = 0;
@@ -434,7 +456,8 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 testUid => activationFamilies.TryGetValue(testUid, out var family)
                     ? family
                     : null,
-                maximumWaveAssignments);
+                maximumWaveAssignments,
+                OrdinaryTimeoutHistory.ContainsKey);
 
             if (requestedAssignments.Count == 0)
             {
@@ -459,6 +482,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 {
                     state.Executed.UnionWith(executed);
                     state.Remaining.RemoveAll(executed.Contains);
+                    state.UnlockFallbackAfterPriorityPasses();
                 }
 
                 if (outcome.FailedByMutant.TryGetValue(state.Mutant.Id, out var failed) && failed.Count > 0)
@@ -469,9 +493,20 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
 
                 if (outcome.TimedOutByMutant.TryGetValue(state.Mutant.Id, out var timedOut) && timedOut.Count > 0)
                 {
+                    foreach (var testUid in timedOut)
+                    {
+                        OrdinaryTimeoutHistory.TryAdd(testUid, 0);
+                    }
                     state.TimedOut.UnionWith(timedOut);
                     state.Unresolved = false;
                 }
+            }
+
+            foreach (var state in unresolved.Where(state => state.Unresolved))
+            {
+                DeprioritizeKnownTimeoutTests(
+                    state.Remaining,
+                    OrdinaryTimeoutHistory.ContainsKey);
             }
 
             var waveMadeProgress = outcome.ExecutedByMutant.Count > 0 ||
@@ -581,47 +616,68 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         IEnumerable<(int MutantId, IReadOnlyList<string> Remaining)> states,
         int sliceSize,
         Func<string, string?>? activationFamilySelector = null,
-        int maximumAssignments = MaximumWaveAssignments)
+        int maximumAssignments = MaximumWaveAssignments,
+        Func<string, bool>? deferredTestSelector = null)
     {
-        var assignments = new Dictionary<string, int>(StringComparer.Ordinal);
-        var activationFamilyOwners = new Dictionary<string, int>(StringComparer.Ordinal);
-        foreach (var (mutantId, remaining) in states)
+        var materializedStates = states.ToList();
+
+        IReadOnlyDictionary<string, int> Build(bool skipDeferred)
         {
-            var assigned = 0;
-            foreach (var testUid in remaining)
+            var assignments = new Dictionary<string, int>(StringComparer.Ordinal);
+            var activationFamilyOwners = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var (mutantId, remaining) in materializedStates)
             {
-                if (assignments.Count >= maximumAssignments)
+                var assigned = 0;
+                foreach (var testUid in remaining)
                 {
-                    return assignments;
-                }
+                    if (skipDeferred && deferredTestSelector!(testUid))
+                    {
+                        continue;
+                    }
 
-                if (assignments.ContainsKey(testUid))
-                {
-                    continue;
-                }
+                    if (assignments.Count >= maximumAssignments)
+                    {
+                        return assignments;
+                    }
 
-                var activationFamily = activationFamilySelector?.Invoke(testUid);
-                if (activationFamily is not null &&
-                    activationFamilyOwners.TryGetValue(activationFamily, out var ownerId) &&
-                    ownerId != mutantId)
-                {
-                    continue;
-                }
+                    if (assignments.ContainsKey(testUid))
+                    {
+                        continue;
+                    }
 
-                assignments[testUid] = mutantId;
-                if (activationFamily is not null)
-                {
-                    activationFamilyOwners[activationFamily] = mutantId;
-                }
+                    var activationFamily = activationFamilySelector?.Invoke(testUid);
+                    if (activationFamily is not null &&
+                        activationFamilyOwners.TryGetValue(activationFamily, out var ownerId) &&
+                        ownerId != mutantId)
+                    {
+                        continue;
+                    }
 
-                if (++assigned >= sliceSize)
-                {
-                    break;
+                    assignments[testUid] = mutantId;
+                    if (activationFamily is not null)
+                    {
+                        activationFamilyOwners[activationFamily] = mutantId;
+                    }
+
+                    if (++assigned >= sliceSize)
+                    {
+                        break;
+                    }
                 }
             }
+
+            return assignments;
         }
 
-        return assignments;
+        if (deferredTestSelector is null)
+        {
+            return Build(skipDeferred: false);
+        }
+
+        var untriedAssignments = Build(skipDeferred: true);
+        return untriedAssignments.Count > 0
+            ? untriedAssignments
+            : Build(skipDeferred: false);
     }
 
     private Dictionary<string, string> GetWaveActivationFamilies()
@@ -658,17 +714,234 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         return requestedAssignments.Values.ToHashSet();
     }
 
-    private List<string> GetWaveTestIdentifiers(IMutant mutant)
+    private MutantWaveState CreateMutantWaveState(IMutant mutant)
     {
-        if (!mutant.AssessingTests.IsEveryTest)
-        {
-            return mutant.AssessingTests.GetIdentifiers().ToList();
-        }
+        var identifiers = !mutant.AssessingTests.IsEveryTest
+            ? mutant.AssessingTests.GetIdentifiers()
+            : GetDiscoveredTestIdentifiers();
+        _configuredIsolationMutationPriorities.TryGetValue(
+            BuildMutationProfileKey(mutant),
+            out var mutationPriorities);
 
+        lock (_discoveryLock)
+        {
+            var plan = BuildPrioritizedWaveTestPlan(
+                identifiers,
+                testUid => _testDescriptions.TryGetValue(testUid, out var description)
+                    ? description.InitialRunTime
+                    : null,
+                testUid => ResolveMutationPriority(
+                    mutationPriorities,
+                    testUid,
+                    _testDescriptions.TryGetValue(testUid, out var description)
+                        ? description.Description.Name
+                        : null));
+            DeprioritizeKnownTimeoutTests(
+                plan.Fallback,
+                OrdinaryTimeoutHistory.ContainsKey);
+            return new MutantWaveState(mutant, plan.Priority, plan.Fallback);
+        }
+    }
+
+    private IReadOnlyCollection<string> GetDiscoveredTestIdentifiers()
+    {
         lock (_discoveryLock)
         {
             return _testDescriptions.Keys.ToList();
         }
+    }
+
+    internal static List<string> OrderWaveTestIdentifiers(
+        IEnumerable<string> identifiers,
+        Func<string, TimeSpan?> durationSelector,
+        Func<string, int>? killScoreSelector = null) =>
+        identifiers
+            .OrderByDescending(identifier => killScoreSelector?.Invoke(identifier) ?? 0)
+            .ThenBy(identifier => durationSelector(identifier) ?? TimeSpan.MaxValue)
+            .ThenBy(identifier => identifier, StringComparer.Ordinal)
+            .ToList();
+
+    internal static (List<string> Priority, List<string> Fallback) BuildPrioritizedWaveTestPlan(
+        IEnumerable<string> identifiers,
+        Func<string, TimeSpan?> durationSelector,
+        Func<string, int> killScoreSelector)
+    {
+        var ordered = OrderWaveTestIdentifiers(
+            identifiers,
+            durationSelector,
+            killScoreSelector);
+        var priority = ordered.Where(identifier => killScoreSelector(identifier) > 0).ToList();
+        return priority.Count == 0
+            ? (ordered, [])
+            : (priority, ordered.Where(identifier => killScoreSelector(identifier) <= 0).ToList());
+    }
+
+    internal static void DeprioritizeKnownTimeoutTests(
+        List<string> identifiers,
+        Func<string, bool> timeoutSelector)
+    {
+        var ordered = identifiers
+            .OrderBy(timeoutSelector)
+            .ToList();
+        identifiers.Clear();
+        identifiers.AddRange(ordered);
+    }
+
+    internal static List<T> OrderIsolationTests<T>(
+        IEnumerable<T> tests,
+        Func<T, int> killScoreSelector,
+        Func<T, TimeSpan?> durationSelector,
+        Func<T, string> identifierSelector) =>
+        tests
+            .OrderByDescending(killScoreSelector)
+            .ThenBy(test => durationSelector(test) ?? TimeSpan.MaxValue)
+            .ThenBy(identifierSelector, StringComparer.Ordinal)
+            .ToList();
+
+    internal static IReadOnlyList<IReadOnlyList<T>> BuildIsolationTestBatches<T>(
+        IReadOnlyList<T> orderedTests,
+        int priorityBatchSize = InitialFreshProcessPriorityTests)
+    {
+        if (priorityBatchSize <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(priorityBatchSize));
+        }
+
+        if (orderedTests.Count <= priorityBatchSize)
+        {
+            return orderedTests.Count == 0 ? [] : [orderedTests];
+        }
+
+        return
+        [
+            orderedTests.Take(priorityBatchSize).ToList(),
+            orderedTests.Skip(priorityBatchSize).ToList(),
+        ];
+    }
+
+    internal static IReadOnlyDictionary<string, int> LoadIsolationTestPriorities(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return new Dictionary<string, int>(StringComparer.Ordinal);
+        }
+
+        if (!File.Exists(path))
+        {
+            throw new FileNotFoundException(
+                $"The configured MTP isolation test priority file does not exist: '{path}'.",
+                path);
+        }
+
+        var names = File.ReadLines(path)
+            .Select(line => line.Trim())
+            .Where(line => line.Length > 0 && !line.StartsWith('#'))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        return names
+            .Select((name, index) => (name, score: names.Count - index))
+            .ToDictionary(entry => entry.name, entry => entry.score, StringComparer.Ordinal);
+    }
+
+    internal static IReadOnlyDictionary<string, IReadOnlyDictionary<string, int>>
+        LoadIsolationMutationPriorities(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return new Dictionary<string, IReadOnlyDictionary<string, int>>(StringComparer.Ordinal);
+        }
+
+        if (!File.Exists(path))
+        {
+            throw new FileNotFoundException(
+                $"The configured MTP isolation mutation profile does not exist: '{path}'.",
+                path);
+        }
+
+        var namesByMutation = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var (line, index) in File.ReadLines(path).Select((line, index) => (line.Trim(), index)))
+        {
+            if (line.Length == 0 || line.StartsWith('#'))
+            {
+                continue;
+            }
+
+            var fields = line.Split('\t');
+            if (fields.Length != 8 || fields.Any(string.IsNullOrWhiteSpace))
+            {
+                throw new InvalidDataException(
+                    $"Isolation mutation profile line {index + 1} must contain " +
+                    "'<source><tab><start-line><tab><start-column><tab><end-line>" +
+                    "<tab><end-column><tab><mutator><tab><replacement-sha256><tab><test-identifier-or-name>'.");
+            }
+
+            var mutationKey = string.Join('\t', fields[..7]);
+            var testName = fields[7].Trim();
+            if (!namesByMutation.TryGetValue(mutationKey, out var names))
+            {
+                names = [];
+                namesByMutation.Add(mutationKey, names);
+            }
+
+            if (!names.Contains(testName, StringComparer.Ordinal))
+            {
+                names.Add(testName);
+            }
+        }
+
+        return namesByMutation.ToDictionary(
+            entry => entry.Key,
+            entry => (IReadOnlyDictionary<string, int>)entry.Value
+                .Select((name, index) => (name, score: entry.Value.Count - index))
+                .ToDictionary(item => item.name, item => item.score, StringComparer.Ordinal),
+            StringComparer.Ordinal);
+    }
+
+    internal static string BuildMutationProfileKey(IMutant mutant)
+    {
+        var location = mutant.Mutation.OriginalNode.GetLocation().GetMappedLineSpan();
+        var path = string.IsNullOrEmpty(location.Path)
+            ? mutant.Mutation.OriginalNode.SyntaxTree.FilePath
+            : location.Path;
+        var replacement = mutant.Mutation.ReplacementNode.ToString();
+        var replacementHash = Convert.ToHexString(
+            SHA256.HashData(Encoding.UTF8.GetBytes(replacement))).ToLowerInvariant();
+        return string.Join(
+            '\t',
+            NormalizeMutationSourcePath(path),
+            location.StartLinePosition.Line + 1,
+            location.StartLinePosition.Character + 1,
+            location.EndLinePosition.Line + 1,
+            location.EndLinePosition.Character + 1,
+            mutant.Mutation.DisplayName,
+            replacementHash);
+    }
+
+    internal static string NormalizeMutationSourcePath(string path)
+    {
+        var normalized = path.Replace('\\', '/');
+        var sourceMarker = normalized.LastIndexOf("/src/", StringComparison.OrdinalIgnoreCase);
+        return sourceMarker >= 0 ? normalized[(sourceMarker + 1)..] : normalized;
+    }
+
+    internal static int ResolveMutationPriority(
+        IReadOnlyDictionary<string, int>? priorities,
+        string testUid,
+        string? testName)
+    {
+        if (priorities is null)
+        {
+            return 0;
+        }
+
+        if (priorities.TryGetValue(testUid, out var uidScore))
+        {
+            return uidScore;
+        }
+
+        return testName is not null && priorities.TryGetValue(testName, out var nameScore)
+            ? nameScore
+            : 0;
     }
 
     private async Task<MutationWaveOutcome> RunMutationWaveAsync(
@@ -865,16 +1138,29 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         bucket.Add(testUid);
     }
 
-    private sealed class MutantWaveState(IMutant mutant, List<string> remaining)
+    private sealed class MutantWaveState(
+        IMutant mutant,
+        List<string> remaining,
+        List<string> fallback)
     {
         public IMutant Mutant { get; } = mutant;
         public List<string> Remaining { get; } = remaining;
+        private List<string> Fallback { get; } = fallback;
         public HashSet<string> Executed { get; } = new(StringComparer.Ordinal);
         public HashSet<string> Failed { get; } = new(StringComparer.Ordinal);
         public HashSet<string> TimedOut { get; } = new(StringComparer.Ordinal);
         public bool Unresolved { get; set; } = true;
         public bool RequiresConfirmation { get; set; }
         public bool Reported { get; set; }
+
+        public void UnlockFallbackAfterPriorityPasses()
+        {
+            if (Unresolved && Remaining.Count == 0 && Fallback.Count > 0)
+            {
+                Remaining.AddRange(Fallback);
+                Fallback.Clear();
+            }
+        }
     }
 
     private sealed class MutationWaveOutcome
@@ -931,6 +1217,11 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 server.Dispose();
             }
             _assemblyServers.Clear();
+            foreach (var client in _isolationClients.Values)
+            {
+                client.Dispose();
+            }
+            _isolationClients.Clear();
         }
 
         _logger.LogDebug("{RunnerId}: Test servers reset complete", RunnerId);
@@ -1288,7 +1579,10 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         if (_coverageMode)
         {
             envVars["STRYKER_COVERAGE_FILE"] = Path.GetFileName(_coverageFilePath);
-            envVars["STRYKER_COVERAGE_MAP_FILE"] = _coverageMapFilePath;
+            if (_perTestCoverageMode)
+            {
+                envVars["STRYKER_COVERAGE_MAP_FILE"] = _coverageMapFilePath;
+            }
         }
 
         return envVars;
@@ -1298,18 +1592,23 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     /// Enables or disables coverage capture mode. When enabled, the test process will track
     /// which mutations are covered and write the data to a file on process exit.
     /// </summary>
-    public void SetCoverageMode(bool enabled)
+    public void SetCoverageMode(bool enabled, bool perTest = true)
     {
         lock (_serverLock)
         {
-            if (_coverageMode == enabled)
+            if (_coverageMode == enabled &&
+                (!enabled || _perTestCoverageMode == perTest))
             {
                 // Already in the desired state; no action needed
                 return;
             }
 
             _coverageMode = enabled;
-            _logger.LogDebug("{RunnerId}: Coverage mode {Status}", RunnerId, enabled ? "enabled" : "disabled");
+            _perTestCoverageMode = enabled && perTest;
+            _logger.LogDebug(
+                "{RunnerId}: Coverage mode {Status}",
+                RunnerId,
+                !enabled ? "disabled" : perTest ? "exact" : "aggregate");
 
             // Reset servers to apply the new environment variables
             foreach (var server in _assemblyServers.Values)
@@ -1317,6 +1616,11 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 server.Dispose();
             }
             _assemblyServers.Clear();
+            foreach (var client in _isolationClients.Values)
+            {
+                client.Dispose();
+            }
+            _isolationClients.Clear();
         }
 
         // Clean up any existing coverage file, even when enabling, to ensure we start fresh
@@ -1411,7 +1715,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         const string header = "stryker-mtp-coverage-v1";
         if (!File.Exists(_coverageMapFilePath))
         {
-            throw new InvalidDataException(
+            throw new CoverageLifecycleSinkUnavailableException(
                 "The xUnit coverage lifecycle sink did not publish per-test coverage.");
         }
 
@@ -1544,6 +1848,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     private async Task<(TestRunResult? Result, bool TimedOut, List<TestNode>? DiscoveredTests)>
         RunAssemblyTestsInFreshProcessAsync(
             string assembly,
+            string? mutationProfileKey,
             ITimeoutValueCalculator? timeoutCalc,
             Func<TestNode, bool>? testUidFilter,
             Func<TestNodeUpdate, bool>? bailPredicate = null)
@@ -1577,6 +1882,103 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             ? null
             : TimeSpan.FromMilliseconds(20_000 + (100 * testsToRun.Count));
 
+        IReadOnlyDictionary<string, int>? mutationPriorities = null;
+        if (mutationProfileKey is not null)
+        {
+            _configuredIsolationMutationPriorities.TryGetValue(
+                mutationProfileKey,
+                out mutationPriorities);
+            _logger.LogDebug(
+                "{RunnerId}: Isolation mutation profile {ProfileState} key {MutationProfileKey}",
+                RunnerId,
+                mutationPriorities is null ? "missed" : "matched",
+                mutationProfileKey);
+        }
+
+        int GetMutationPriority(TestNode test)
+        {
+            var testName = _testDescriptions.TryGetValue(test.Uid, out var description)
+                ? description.Description.Name
+                : null;
+            return ResolveMutationPriority(mutationPriorities, test.Uid, testName);
+        }
+
+        List<TestNode> orderedTests;
+        lock (_discoveryLock)
+        {
+            orderedTests = OrderIsolationTests(
+                testsToRun,
+                test =>
+                {
+                    var learnedScore = IsolationKillHistory.GetValueOrDefault(
+                        IsolationHistoryKey(assembly, test.Uid));
+                    var mutationScore = GetMutationPriority(test);
+                    if (mutationScore > 0)
+                    {
+                        return 100_000_000 + (mutationScore * 1_000) + learnedScore;
+                    }
+
+                    if (_testDescriptions.TryGetValue(test.Uid, out var description) &&
+                        _configuredIsolationPriorities.TryGetValue(
+                            description.Description.Name,
+                            out var configuredScore))
+                    {
+                        return (configuredScore * 1_000) + learnedScore;
+                    }
+
+                    return learnedScore;
+                },
+                test =>
+                    _testDescriptions.TryGetValue(test.Uid, out var description)
+                        ? description.InitialRunTime
+                        : null,
+                test => test.Uid);
+        }
+
+        var exactPriorityTests = orderedTests
+            .Where(test => GetMutationPriority(test) > 0)
+            .ToList();
+        if (exactPriorityTests.Count > 0)
+        {
+            // A measured killer can avoid one OS process: the persistent broker creates a
+            // fresh collectible context, publishes the mutant before loading product code,
+            // runs only the exact prior killer, and refuses the next request unless the context
+            // unloads. Collectible execution is a fast-path proof only. A stale profile, timeout,
+            // host loss, or unload failure falls through to ReadyToRun-preserving fresh-process
+            // ground truth instead of assigning a verdict.
+            var fastExecution = await GetOrCreateIsolationClient(assembly)
+                .ExecuteAsync(
+                    exactPriorityTests.Select(test => test.Uid).ToList(),
+                    TimeSpan.FromSeconds(20))
+                .ConfigureAwait(false);
+            _logger.LogDebug(
+                "{RunnerId}: Collectible isolation returned {TestCount} tests, timedOut={TimedOut}, unloaded={Unloaded}, error={Error}",
+                RunnerId,
+                fastExecution.Tests.Count,
+                fastExecution.SessionTimedOut,
+                fastExecution.Unloaded,
+                fastExecution.Error);
+            if (CanTrustCollectibleKill(fastExecution))
+            {
+                foreach (var killedTest in fastExecution.Tests.Where(test =>
+                             string.Equals(test.State, "failed", StringComparison.Ordinal)))
+                {
+                    IsolationKillHistory.AddOrUpdate(
+                        IsolationHistoryKey(assembly, killedTest.TestCaseId),
+                        1,
+                        static (_, count) => count + 1);
+                }
+
+                return (
+                    BuildCollectibleTestRunResult(
+                        fastExecution.Tests,
+                        discoveredTests.Count,
+                        TimeSpan.FromTicks(fastExecution.DurationTicks)),
+                    false,
+                    discoveredTests);
+            }
+        }
+
         var stopwatch = Stopwatch.StartNew();
         var server = new AssemblyTestServer(assembly, BuildEnvironmentVariables(), _logger, RunnerId, _options);
         try
@@ -1590,14 +1992,41 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                     discoveredTests);
             }
 
-            var (testResults, timedOut) = await server
-                // A dedicated process has the same streamed progress contract as a
-                // warm host. Healthy cold runs publish their first update well inside
-                // the 30-second startup window and continue inside the 10-second active
-                // window; an isolation mutant that exceeds either window is genuinely
-                // stalled and must not consume the entire broad session budget.
-                .RunTestsAsync(testsToRun.ToArray(), timeout, bailPredicate, stallDetection: true)
-                .ConfigureAwait(false);
+            // Give measured killers one small scheduling window, then submit the complete
+            // remainder once. A single broad request lets xUnit start hundreds of tests before
+            // cancellation reaches it, while progressive growth makes survivors pay repeated
+            // MTP request setup. Two requests preserve fast kills and bound survivor overhead.
+            var testResults = new List<TestNodeUpdate>();
+            var timedOut = false;
+            var exactPriorityTestCount = orderedTests.Count(test => GetMutationPriority(test) > 0);
+            var priorityBatchSize = exactPriorityTestCount > 0
+                ? exactPriorityTestCount
+                : InitialFreshProcessPriorityTests;
+            foreach (var batch in BuildIsolationTestBatches(orderedTests, priorityBatchSize))
+            {
+                var (batchResults, batchTimedOut) = await server
+                    .RunTestsAsync(batch.ToArray(), timeout, bailPredicate, stallDetection: true)
+                    .ConfigureAwait(false);
+                testResults.AddRange(batchResults);
+                timedOut |= batchTimedOut;
+                if (batchTimedOut ||
+                    (bailPredicate is not null && batchResults.Any(update =>
+                        update.Node.ExecutionState is TestNodeStates.Failed or
+                            TestNodeStates.Error or TestNodeStates.TimedOut)))
+                {
+                    break;
+                }
+            }
+
+            foreach (var killedTest in testResults.Where(update =>
+                         update.Node.ExecutionState is TestNodeStates.Failed or TestNodeStates.Error))
+            {
+                IsolationKillHistory.AddOrUpdate(
+                    IsolationHistoryKey(assembly, killedTest.Node.Uid),
+                    1,
+                    static (_, count) => count + 1);
+            }
+
             var result = BuildTestRunResult(
                 NormalizeToDiscoveredCases(testResults, discoveredTests),
                 discoveredTests.Count,
@@ -1620,6 +2049,55 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             }
             server.Dispose();
         }
+    }
+
+    private static string IsolationHistoryKey(string assembly, string testUid) =>
+        string.Concat(assembly, "\0", testUid);
+
+    internal static bool CanTrustCollectibleKill(CollectibleIsolationResponse response) =>
+        !response.SessionTimedOut &&
+        response.Unloaded &&
+        string.IsNullOrWhiteSpace(response.Error) &&
+        response.Tests.Any(test =>
+            string.Equals(test.State, "failed", StringComparison.Ordinal));
+
+    private TestRunResult BuildCollectibleTestRunResult(
+        IReadOnlyCollection<CollectibleIsolationTestResult> testResults,
+        int totalDiscoveredTests,
+        TimeSpan duration)
+    {
+        var resultsByTest = testResults
+            .GroupBy(result => result.TestCaseId, StringComparer.Ordinal)
+            .ToList();
+        var executedIds = resultsByTest.Select(result => result.Key).ToList();
+        var failedIds = resultsByTest
+            .Where(results => results.Any(result =>
+                string.Equals(result.State, "failed", StringComparison.Ordinal)))
+            .Select(results => results.Key)
+            .ToList();
+        var messages = testResults
+            .Where(result => !string.IsNullOrWhiteSpace(result.Message))
+            .Select(result => result.Message!)
+            .ToList();
+        var executedTests =
+            totalDiscoveredTests > 0 && executedIds.Count >= totalDiscoveredTests
+                ? TestIdentifierList.EveryTest()
+                : new TestIdentifierList(executedIds);
+
+        IEnumerable<MtpTestDescription> descriptions;
+        lock (_discoveryLock)
+        {
+            descriptions = _testDescriptions.Values.ToList();
+        }
+
+        return new TestRunResult(
+            descriptions,
+            executedTests,
+            new TestIdentifierList(failedIds),
+            TestIdentifierList.NoTest(),
+            string.Join(Environment.NewLine, messages),
+            messages,
+            duration);
     }
 
     private async Task<AssemblyTestServer> GetOrCreateServerAsync(string assembly)
@@ -1663,6 +2141,25 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         }
 
         return server;
+    }
+
+    private CollectibleTestIsolationClient GetOrCreateIsolationClient(string assembly)
+    {
+        lock (_serverLock)
+        {
+            if (_isolationClients.TryGetValue(assembly, out var existing))
+            {
+                return existing;
+            }
+
+            var client = new CollectibleTestIsolationClient(
+                assembly,
+                BuildEnvironmentVariables(),
+                _logger,
+                RunnerId);
+            _isolationClients.Add(assembly, client);
+            return client;
+        }
     }
 
     /// <summary>
@@ -1898,34 +2395,17 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             // through the published map.
             WriteMutantIdToFile(mutantId);
 
-            if (packedAssignments is { Count: > 0 } && mutants is { Count: > 0 } && bailPredicate is null)
-            {
-                // Cancel when every assigned mutant has a verdict. MTP acknowledges cancellation
-                // before its scheduler necessarily drains, so the packed call path force-discards
-                // this host before the next request publishes a different activation map.
-                var unresolved = new HashSet<int>(mutants.Select(m => m.Id));
-                var bailLock = new object();
-                bailPredicate = update =>
-                {
-                    if (update.Node.ExecutionState is not (TestNodeStates.Failed or TestNodeStates.Error or TestNodeStates.TimedOut))
-                    {
-                        return false;
-                    }
-
-                    if (!packedAssignments.TryGetValue(update.Node.Uid, out var ownerId))
-                    {
-                        return false;
-                    }
-
-                    lock (bailLock)
-                    {
-                        unresolved.Remove(ownerId);
-                        return unresolved.Count == 0;
-                    }
-                };
-            }
+            // A packed wave is deliberately small and must finish normally. Cancelling when all
+            // assigned mutants have verdicts saves only the unstarted tail of this one bounded
+            // request, while MTP cannot prove that its scheduler drained before acknowledging the
+            // cancellation. The only safe response was therefore to kill the reusable host. On a
+            // kill-heavy campaign that turns ordinary mutation into thousands of cold process
+            // starts, which costs far more than completing the remaining wave tests.
 
             var accumulator = new TestRunAccumulator();
+            var mutationProfileKey = mutants is { Count: 1 }
+                ? BuildMutationProfileKey(mutants[0])
+                : null;
 
             foreach (var assembly in assemblies)
             {
@@ -1933,6 +2413,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                     useFreshProcess
                         ? await RunAssemblyTestsInFreshProcessAsync(
                             assembly,
+                            mutationProfileKey,
                             timeoutCalc,
                             testUidFilter,
                             bailPredicate).ConfigureAwait(false)
@@ -2127,8 +2608,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             testUidFilter,
             timeout,
             bailPredicate,
-            stallDetection: parallelSession,
-            discardOnBail: parallelSession).ConfigureAwait(false);
+            stallDetection: parallelSession).ConfigureAwait(false);
 
         return (testResults as TestRunResult, timedOut, discoveredTests);
     }
@@ -2324,6 +2804,11 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                     server.Dispose();
                 }
                 _assemblyServers.Clear();
+                foreach (var client in _isolationClients.Values)
+                {
+                    client.Dispose();
+                }
+                _isolationClients.Clear();
             }
 
             // Clean up temp files
