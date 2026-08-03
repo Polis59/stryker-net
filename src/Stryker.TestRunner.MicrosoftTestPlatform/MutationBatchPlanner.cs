@@ -68,13 +68,18 @@ public static class MutationBatchPlanner
         groups.AddRange(PackDisjointMutants(remaining.Where(RequiresProcessIsolation)));
         remaining.RemoveAll(RequiresProcessIsolation);
 
-        groups.AddRange(
-            remaining
-                .Where(mutant => mutant.AssessingTests.Count > MaximumSerialSessionTests)
-                .Select(mutant => new List<IMutant> { mutant }));
-        remaining.RemoveAll(mutant => mutant.AssessingTests.Count > MaximumSerialSessionTests);
-
-        groups.AddRange(PackDisjointMutants(remaining));
+        // Ordinary mutants may overlap because the MTP runner advances a batch in waves.
+        // A test contested by several mutants is assigned to one of them in the current wave
+        // and remains available to the others in later waves. Chunking by twice the worker
+        // count keeps every worker fed without creating thousands of fixture-paying groups.
+        if (remaining.Count > 0)
+        {
+            var chunkCount = Math.Min(
+                remaining.Count,
+                Math.Max(1, options.Concurrency) * 2);
+            var chunkSize = (remaining.Count + chunkCount - 1) / chunkCount;
+            groups.AddRange(remaining.Chunk(chunkSize).Select(chunk => chunk.ToList()));
+        }
 
         ReportPlan(groups);
         return groups;

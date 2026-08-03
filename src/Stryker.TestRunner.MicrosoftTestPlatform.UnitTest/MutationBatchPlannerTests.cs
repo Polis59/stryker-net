@@ -39,11 +39,12 @@ public class MutationBatchPlannerTests
     }
 
     [TestMethod]
-    public void PackedGroupsHaveBoundedMutantCounts()
+    public void WaveBatchesAreSpreadAcrossTwiceTheWorkerCount()
     {
         var options = new Mock<IStrykerOptions>();
         options.SetupGet(candidate => candidate.OptimizationMode)
             .Returns(OptimizationModes.CoverageBasedTest);
+        options.SetupGet(candidate => candidate.Concurrency).Returns(4);
         var mutants = Enumerable.Range(0, 100)
             .Select(index => CreateMutant(new TestIdentifierList($"test-{index}")))
             .ToList();
@@ -51,8 +52,25 @@ public class MutationBatchPlannerTests
         var groups = MutationBatchPlanner.Build(options.Object, mutants).ToList();
 
         groups.Sum(group => group.Count).ShouldBe(mutants.Count);
-        groups.Max(group => group.Count).ShouldBe(16);
-        groups.ShouldAllBe(group => group.Count <= 16);
+        groups.Count.ShouldBe(8);
+        groups.Max(group => group.Count).ShouldBe(13);
+    }
+
+    [TestMethod]
+    public void OverlappingOrdinaryMutantsShareWaveBatches()
+    {
+        var options = new Mock<IStrykerOptions>();
+        options.SetupGet(candidate => candidate.OptimizationMode)
+            .Returns(OptimizationModes.CoverageBasedTest);
+        options.SetupGet(candidate => candidate.Concurrency).Returns(1);
+        var mutants = Enumerable.Range(0, 4)
+            .Select(_ => CreateMutant(new TestIdentifierList("shared-test")))
+            .ToList();
+
+        var groups = MutationBatchPlanner.Build(options.Object, mutants).ToList();
+
+        groups.Count.ShouldBe(2);
+        groups.ShouldAllBe(group => group.Count == 2);
     }
 
     [TestMethod]

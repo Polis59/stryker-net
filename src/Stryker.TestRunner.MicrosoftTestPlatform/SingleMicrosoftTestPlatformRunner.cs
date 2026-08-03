@@ -16,10 +16,10 @@ namespace Stryker.TestRunner.MicrosoftTestPlatform;
 /// environment variables. Used by MicrosoftTestPlatformRunnerPool.
 /// Maintains persistent test server connections per assembly to reduce process startup overhead.
 /// Uses file-based mutant control to allow changing the active mutant without restarting processes.
-/// Disjoint ordinary mutants share a request through a test-case activation map consumed by the
-/// test framework's synchronous xUnit lifecycle sink.
-/// Mutants that need static-state isolation execute in fresh collectible load contexts inside a
-/// broker process, see <see cref="RequiresProcessIsolation"/>.
+/// Ordinary mutants advance through parallel waves using a test-case activation map consumed by
+/// the test framework's synchronous xUnit lifecycle sink. Overlapping tests serve their mutants
+/// in successive waves. Mutants that need static-state isolation execute in fresh test
+/// applications, see <see cref="RequiresProcessIsolation"/>.
 /// </summary>
 public class SingleMicrosoftTestPlatformRunner : IDisposable
 {
@@ -112,9 +112,6 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
     /// </summary>
     private Dictionary<string, int> WriteParallelMutantMap(IReadOnlyList<IMutant> mutants)
     {
-        DeleteIfExists(_mutantMapAcknowledgementFilePath);
-        DeleteIfExists(_mutantMapErrorFilePath);
-
         var assignments = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (var mutant in mutants)
         {
@@ -136,6 +133,27 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 }
 
                 assignments[testUid] = mutant.Id;
+            }
+        }
+
+        return WriteParallelMutantMap(assignments);
+    }
+
+    private Dictionary<string, int> WriteParallelMutantMap(
+        IReadOnlyDictionary<string, int> requestedAssignments)
+    {
+        DeleteIfExists(_mutantMapAcknowledgementFilePath);
+        DeleteIfExists(_mutantMapErrorFilePath);
+
+        var assignments = new Dictionary<string, int>(requestedAssignments, StringComparer.Ordinal);
+        foreach (var testUid in assignments.Keys)
+        {
+            if (testUid.Contains('\t', StringComparison.Ordinal) ||
+                testUid.Contains('\r', StringComparison.Ordinal) ||
+                testUid.Contains('\n', StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"Test identifier '{testUid}' cannot be represented by the mutation activation protocol.");
             }
         }
 
@@ -263,15 +281,20 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             throw new ArgumentException("At least one mutant is required.", nameof(mutants));
         }
 
-        // A multi-mutant group multiplexes through one parallel request: the map binds each
-        // covering test to its mutant, and the injected helper resolves that binding before the
-        // complete test lifecycle. Ordinary groups reuse the warm host. An all-isolation group
-        // pays one fresh process so every static path starts unloaded, while disjoint coverage
-        // prevents one assigned test from initializing another packed mutant's path. A group
-        // that the budget cannot afford leaves unresolved mutants pending for the executor's
-        // one-at-a-time truth court below.
+        // An all-isolation group pays one fresh process and uses one disjoint activation map.
+        // Ordinary groups may contain overlapping assessing sets; the wave runner below assigns
+        // a contested test to one mutant at a time across successive warm-host requests.
         var packedIsolation = mutants.Count > 1 && mutants.All(RequiresProcessIsolation);
-        if (mutants.Count > 1 && (packedIsolation || !mutants.Any(RequiresProcessIsolation)))
+        if (mutants.Count > 1 && !mutants.Any(RequiresProcessIsolation))
+        {
+            return await TestOrdinaryMutantsInWavesAsync(
+                assemblies,
+                mutants,
+                update,
+                timeoutCalc).ConfigureAwait(false);
+        }
+
+        if (packedIsolation)
         {
             var packedAssignments = WriteParallelMutantMap(mutants);
             try
@@ -350,6 +373,249 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         }
 
         return lastResult!;
+    }
+
+    /// <summary>
+    /// Advances an ordinary batch through small parallel waves. Each wave assigns a test to at
+    /// most one mutant, so overlapping coverage is served across later requests instead of
+    /// fragmenting the campaign into thousands of groups. Most killed mutants resolve in the
+    /// first seven test executions. Every unresolved mutant then receives a complete fresh-process
+    /// run before a survivor, timeout, or runtime-error verdict is accepted.
+    /// </summary>
+    private async Task<ITestRunResult> TestOrdinaryMutantsInWavesAsync(
+        IReadOnlyList<string> assemblies,
+        IReadOnlyList<IMutant> mutants,
+        TestUpdateHandler? update,
+        ITimeoutValueCalculator? timeoutCalc)
+    {
+        var states = mutants
+            .Select(mutant => new MutantWaveState(
+                mutant,
+                mutant.AssessingTests.GetIdentifiers().ToList()))
+            .ToList();
+        var stopwatch = Stopwatch.StartNew();
+        var waveCount = 0;
+        var waveTestCount = 0;
+        var confirmationCount = 0;
+
+        // Cheap early waves maximize first-kill throughput. A survivor is never inferred from
+        // this sample: unresolved mutants go through their complete assessing set below.
+        int[] waveSlices = [1, 2, 4];
+        foreach (var sliceSize in waveSlices)
+        {
+            var unresolved = states
+                .Where(state => state.Unresolved && state.Remaining.Count > 0)
+                .ToList();
+            if (unresolved.Count == 0)
+            {
+                break;
+            }
+
+            var requestedAssignments = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var state in unresolved)
+            {
+                var assigned = 0;
+                for (var index = 0; assigned < sliceSize && index < state.Remaining.Count; index++)
+                {
+                    var testUid = state.Remaining[index];
+                    if (requestedAssignments.ContainsKey(testUid))
+                    {
+                        continue;
+                    }
+
+                    requestedAssignments[testUid] = state.Mutant.Id;
+                    state.Remaining.RemoveAt(index--);
+                    assigned++;
+                }
+            }
+
+            if (requestedAssignments.Count == 0)
+            {
+                break;
+            }
+
+            waveCount++;
+            waveTestCount += requestedAssignments.Count;
+            var outcome = await RunMutationWaveAsync(
+                assemblies,
+                unresolved.Select(state => state.Mutant).ToList(),
+                requestedAssignments,
+                timeoutCalc).ConfigureAwait(false);
+
+            foreach (var state in unresolved)
+            {
+                if (outcome.ExecutedByMutant.TryGetValue(state.Mutant.Id, out var executed))
+                {
+                    state.Executed.UnionWith(executed);
+                }
+
+                if (outcome.FailedByMutant.TryGetValue(state.Mutant.Id, out var failed) && failed.Count > 0)
+                {
+                    state.Failed.UnionWith(failed);
+                    state.Unresolved = false;
+                }
+            }
+
+            if (outcome.HadRuntimeIssue || outcome.TimedOut)
+            {
+                break;
+            }
+        }
+
+        foreach (var state in states.Where(candidate => candidate.Unresolved))
+        {
+            confirmationCount++;
+            ITestRunResult? result = null;
+            const int maxAttempts = 2;
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                result = await RunAllTestsAsync(
+                    assemblies,
+                    state.Mutant.Id,
+                    [state.Mutant],
+                    update: null,
+                    timeoutCalc,
+                    BuildTestUidFilter([state.Mutant]),
+                    useFreshProcess: true,
+                    bailPredicate: CreateSingleMutantBailPredicate(isRuntimeRetry: attempt > 1))
+                    .ConfigureAwait(false);
+                if (!result.SessionHadRuntimeIssue || attempt == maxAttempts)
+                {
+                    break;
+                }
+            }
+
+            var confirmedResult = result!;
+            update?.Invoke(
+                [state.Mutant],
+                confirmedResult.FailingTests,
+                confirmedResult.ExecutedTests,
+                confirmedResult.TimedOutTests);
+            if (update is null || confirmedResult.SessionTimedOut || confirmedResult.SessionHadRuntimeIssue)
+            {
+                state.Mutant.AnalyzeTestRun(
+                    confirmedResult.FailingTests,
+                    confirmedResult.ExecutedTests,
+                    confirmedResult.TimedOutTests,
+                    confirmedResult.SessionTimedOut,
+                    confirmedResult.SessionHadRuntimeIssue);
+            }
+
+            state.Reported = true;
+        }
+
+        foreach (var state in states.Where(candidate => !candidate.Reported))
+        {
+            var executed = new TestIdentifierList(state.Executed);
+            var failed = new TestIdentifierList(state.Failed);
+            update?.Invoke([state.Mutant], failed, executed, TestIdentifierList.NoTest());
+            if (update is null)
+            {
+                state.Mutant.AnalyzeTestRun(
+                    failed,
+                    executed,
+                    TestIdentifierList.NoTest(),
+                    sessionTimedOut: false,
+                    sessionRuntimeError: false);
+            }
+        }
+
+        _logger.LogInformation(
+            "{RunnerId}: Wave batch completed: mutants {MutantCount}, waves {WaveCount}, " +
+            "wave tests {WaveTestCount}, fresh confirmations {ConfirmationCount}, duration {DurationMs} ms",
+            RunnerId,
+            mutants.Count,
+            waveCount,
+            waveTestCount,
+            confirmationCount,
+            stopwatch.ElapsedMilliseconds);
+        return new TestRunResult(true);
+    }
+
+    private async Task<MutationWaveOutcome> RunMutationWaveAsync(
+        IReadOnlyList<string> assemblies,
+        IReadOnlyList<IMutant> mutants,
+        IReadOnlyDictionary<string, int> requestedAssignments,
+        ITimeoutValueCalculator? timeoutCalc)
+    {
+        var outcome = new MutationWaveOutcome();
+        var publishedAssignments = WriteParallelMutantMap(requestedAssignments);
+        try
+        {
+            var requestedTestIds = requestedAssignments.Keys.ToHashSet(StringComparer.Ordinal);
+            var result = await RunAllTestsAsync(
+                assemblies,
+                mutantId: -1,
+                mutants,
+                update: null,
+                timeoutCalc,
+                node => requestedTestIds.Contains(node.Uid),
+                packedAssignments: publishedAssignments).ConfigureAwait(false);
+
+            outcome.TimedOut = result.SessionTimedOut;
+            outcome.HadRuntimeIssue = result.SessionHadRuntimeIssue;
+            if (outcome.HadRuntimeIssue)
+            {
+                return outcome;
+            }
+
+            var executedIds = result.ExecutedTests.IsEveryTest
+                ? requestedAssignments.Keys
+                : result.ExecutedTests.GetIdentifiers();
+            foreach (var testUid in executedIds)
+            {
+                if (requestedAssignments.TryGetValue(testUid, out var mutantId))
+                {
+                    AddToBucket(outcome.ExecutedByMutant, mutantId, testUid);
+                }
+            }
+
+            foreach (var testUid in result.FailingTests.GetIdentifiers())
+            {
+                if (requestedAssignments.TryGetValue(testUid, out var mutantId))
+                {
+                    AddToBucket(outcome.FailedByMutant, mutantId, testUid);
+                }
+            }
+
+            return outcome;
+        }
+        finally
+        {
+            WriteInactiveMutantMap();
+        }
+    }
+
+    private static void AddToBucket(
+        IDictionary<int, HashSet<string>> buckets,
+        int mutantId,
+        string testUid)
+    {
+        if (!buckets.TryGetValue(mutantId, out var bucket))
+        {
+            bucket = new HashSet<string>(StringComparer.Ordinal);
+            buckets[mutantId] = bucket;
+        }
+
+        bucket.Add(testUid);
+    }
+
+    private sealed class MutantWaveState(IMutant mutant, List<string> remaining)
+    {
+        public IMutant Mutant { get; } = mutant;
+        public List<string> Remaining { get; } = remaining;
+        public HashSet<string> Executed { get; } = new(StringComparer.Ordinal);
+        public HashSet<string> Failed { get; } = new(StringComparer.Ordinal);
+        public bool Unresolved { get; set; } = true;
+        public bool Reported { get; set; }
+    }
+
+    private sealed class MutationWaveOutcome
+    {
+        public Dictionary<int, HashSet<string>> ExecutedByMutant { get; } = [];
+        public Dictionary<int, HashSet<string>> FailedByMutant { get; } = [];
+        public bool TimedOut { get; set; }
+        public bool HadRuntimeIssue { get; set; }
     }
 
     internal static Func<TestNodeUpdate, bool>? CreateSingleMutantBailPredicate(bool isRuntimeRetry) =>
