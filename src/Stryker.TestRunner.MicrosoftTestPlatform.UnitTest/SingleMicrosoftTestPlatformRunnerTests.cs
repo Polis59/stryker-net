@@ -65,23 +65,6 @@ public class SingleMicrosoftTestPlatformRunnerTests
     }
 
     [TestMethod]
-    public void UnattributedIsolationProbesAreShortOnlyWhileStillAmbiguous()
-    {
-        SingleMicrosoftTestPlatformRunner.GetIsolationProbeTimeout(
-                assignmentCount: 8,
-                isolatingUnattributedFailure: true)
-            .ShouldBe(TimeSpan.FromSeconds(2));
-        SingleMicrosoftTestPlatformRunner.GetIsolationProbeTimeout(
-                assignmentCount: 1,
-                isolatingUnattributedFailure: true)
-            .ShouldBeNull();
-        SingleMicrosoftTestPlatformRunner.GetIsolationProbeTimeout(
-                assignmentCount: 8,
-                isolatingUnattributedFailure: false)
-            .ShouldBeNull();
-    }
-
-    [TestMethod]
     public void WaveAssignmentsDoNotSplitOneRuntimeExpandedMethodAcrossMutants()
     {
         var states = new[]

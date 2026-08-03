@@ -24,7 +24,6 @@ namespace Stryker.TestRunner.MicrosoftTestPlatform;
 public class SingleMicrosoftTestPlatformRunner : IDisposable
 {
     private const int MaximumWaveAssignments = 64;
-    private static readonly TimeSpan UnattributedIsolationProbeTimeout = TimeSpan.FromSeconds(2);
     private const string InactiveMutantMapHeader = "stryker-mtp-activation-map-v1\toff";
     // Parallel multiplexed sessions: the injected MutantControl resolves each test's assigned
     // mutant through xUnit's ambient TestContext and acknowledges this map itself, so a
@@ -404,7 +403,6 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         var confirmationCount = 0;
         var activationFamilies = GetWaveActivationFamilies();
         var maximumWaveAssignments = MaximumWaveAssignments;
-        var isolatingUnattributedFailure = false;
 
         // Cheap early waves maximize first-kill throughput. Later waves keep multiplexing the
         // exact remaining coverage instead of collapsing thousands of unresolved mutants into
@@ -445,10 +443,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                     .Select(state => state.Mutant)
                     .ToList(),
                 requestedAssignments,
-                timeoutCalc,
-                GetIsolationProbeTimeout(
-                    requestedAssignments.Count,
-                    isolatingUnattributedFailure)).ConfigureAwait(false);
+                timeoutCalc).ConfigureAwait(false);
 
             foreach (var state in unresolved)
             {
@@ -486,7 +481,6 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 // Retry a smaller prefix until the failing work is isolated; only a single-test
                 // request is allowed to fall back to individual confirmation.
                 maximumWaveAssignments = Math.Max(1, requestedAssignments.Count / 2);
-                isolatingUnattributedFailure = true;
                 sliceSize = 1;
                 continue;
             }
@@ -574,13 +568,6 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
             stopwatch.ElapsedMilliseconds);
         return new TestRunResult(true);
     }
-
-    internal static TimeSpan? GetIsolationProbeTimeout(
-        int assignmentCount,
-        bool isolatingUnattributedFailure) =>
-        isolatingUnattributedFailure && assignmentCount > 1
-            ? UnattributedIsolationProbeTimeout
-            : null;
 
     internal static IReadOnlyDictionary<string, int> BuildWaveAssignments(
         IEnumerable<(int MutantId, IReadOnlyList<string> Remaining)> states,
@@ -680,8 +667,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         IReadOnlyList<string> assemblies,
         IReadOnlyList<IMutant> mutants,
         IReadOnlyDictionary<string, int> requestedAssignments,
-        ITimeoutValueCalculator? timeoutCalc,
-        TimeSpan? timeoutCeiling)
+        ITimeoutValueCalculator? timeoutCalc)
     {
         var outcome = new MutationWaveOutcome();
         var stopwatch = Stopwatch.StartNew();
@@ -696,8 +682,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 update: null,
                 timeoutCalc,
                 node => requestedTestIds.Contains(node.Uid),
-                packedAssignments: publishedAssignments,
-                parallelTimeoutCeiling: timeoutCeiling).ConfigureAwait(false);
+                packedAssignments: publishedAssignments).ConfigureAwait(false);
 
             outcome.TimedOut = result.SessionTimedOut;
             outcome.HadRuntimeIssue = result.SessionHadRuntimeIssue;
@@ -1820,8 +1805,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         Func<TestNode, bool>? testUidFilter = null,
         bool useFreshProcess = false,
         Func<TestNodeUpdate, bool>? bailPredicate = null,
-        IReadOnlyDictionary<string, int>? packedAssignments = null,
-        TimeSpan? parallelTimeoutCeiling = null)
+        IReadOnlyDictionary<string, int>? packedAssignments = null)
     {
         try
         {
@@ -1876,8 +1860,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                             timeoutCalc,
                             testUidFilter,
                             bailPredicate,
-                            parallelSession: packedAssignments is not null,
-                            parallelTimeoutCeiling).ConfigureAwait(false);
+                            parallelSession: packedAssignments is not null).ConfigureAwait(false);
 
                 if (discoveredTests is not null)
                 {
@@ -2034,8 +2017,7 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
         ITimeoutValueCalculator? timeoutCalc,
         Func<TestNode, bool>? testUidFilter = null,
         Func<TestNodeUpdate, bool>? bailPredicate = null,
-        bool parallelSession = false,
-        TimeSpan? parallelTimeoutCeiling = null)
+        bool parallelSession = false)
     {
         if (!File.Exists(assembly))
         {
@@ -2052,10 +2034,6 @@ public class SingleMicrosoftTestPlatformRunner : IDisposable
                 ? discoveredTests
                 : discoveredTests.Where(testUidFilter).ToList();
             timeout = CalculateAssemblyTimeout(testsToRun, timeoutCalc, assembly, parallelSession);
-            if (parallelSession && parallelTimeoutCeiling.HasValue && timeout > parallelTimeoutCeiling)
-            {
-                timeout = parallelTimeoutCeiling;
-            }
         }
 
         var (testResults, timedOut) = await RunAssemblyTestsInternalAsync(
